@@ -6,37 +6,135 @@ Full setup-to-run guide for the DeepStream SUTrack tracker on Jetson.
 
 ## 1. System Requirements
 
-| Item | Requirement |
-|------|------------|
-| Device | NVIDIA Jetson (Orin / Xavier / AGX) |
-| Software | JetPack 5.x with DeepStream 6.x or 7.x |
-| Python | 3.8+ (pre-installed with JetPack) |
-| Engine | sutrack_fp32.engine (FP32 mandatory -- see section 3) |
+| Item | Requirement | Notes |
+|------|------------|-------|
+| Device | NVIDIA Jetson (Orin / Xavier / AGX) | Tested on Orin |
+| JetPack | 5.x (L4T r35 or r36) | Bundles CUDA, cuDNN, TensorRT |
+| DeepStream | 6.x or 7.x | Must match JetPack version |
+| Python | 3.8 -- 3.10 | Pre-installed with JetPack |
+| pyds | Matching DeepStream version | Python bindings for DeepStream metadata API |
+| GstRtspServer | >= 1.14 | Required for RTSP streaming (Phase 5+) |
+| Engine | sutrack_fp32.engine (FP32 mandatory) | See section 3 |
+
+Verify your base system before installing anything:
+
+```bash
+# Show JetPack / L4T version
+cat /etc/nv_tegra_release
+
+# Confirm DeepStream is installed
+deepstream-app --version-all
+
+# Confirm TensorRT (should already be present)
+python3 -c "import tensorrt as trt; print(trt.__version__)"
+```
 
 ---
 
 ## 2. Install Dependencies
 
+Install all required software in the order below.
+Each step has a verify command -- do not skip them.
+
+### 2a -- System packages (GStreamer + RTSP server)
+
 ```bash
-# DeepStream Python bindings (already in JetPack; install the wheel)
-pip install /opt/nvidia/deepstream/deepstream/lib/pyds-*.whl
-
-# Python packages (no PyTorch required)
-pip install numpy opencv-python pyyaml cuda-python
-
-# GStreamer Python bindings
+sudo apt-get update
 sudo apt-get install -y \
-    python3-gi python3-gst-1.0 \
+    python3-gi \
+    python3-gst-1.0 \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good
-
-# Verify
-python -c "import pyds; print('OK pyds')"
-python -c "from cuda import cudart; print('OK cudart')"
-python -c "import tensorrt as trt; print('OK TRT', trt.__version__)"
-python -c "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; print('OK GStreamer')"
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-rtsp \
+    libgstrtspserver-1.0-dev \
+    gir1.2-gst-rtsp-server-1.0
 ```
+
+> `gir1.2-gst-rtsp-server-1.0` provides the GObject Introspection bindings that allow
+> Python to call `GstRtspServer`. Without it the RTSP server silently fails to start.
+
+Verify:
+
+```bash
+python3 -c "
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer
+print('OK GStreamer', Gst.version_string())
+print('OK GstRtspServer')
+"
+```
+
+### 2b -- DeepStream Python bindings (pyds)
+
+```bash
+# Locate the wheel -- path includes the DS version number
+find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null
+
+# Install (glob expands to the correct version)
+pip install /opt/nvidia/deepstream/deepstream/lib/pyds-*.whl
+```
+
+If the wheel is not found, your DeepStream installation may be incomplete.
+Re-run `deepstream-app --version-all` to check.
+
+Verify:
+
+```bash
+python3 -c "import pyds; print('OK pyds')"
+```
+
+### 2c -- Python runtime packages
+
+No PyTorch is required at runtime.
+
+```bash
+pip install numpy opencv-python pyyaml cuda-python
+```
+
+| Package | Version (tested) | Why |
+|---------|-----------------|-----|
+| `numpy` | >= 1.21 | all tracker preprocessing is pure-NumPy |
+| `opencv-python` | >= 4.5 | ROI selection window, RGBA → BGR conversion |
+| `pyyaml` | >= 5.4 | load `tracker_config.yml` |
+| `cuda-python` | >= 11.7 | `cuda.cudart` CUDA buffer management (replaces pycuda) |
+
+Verify:
+
+```bash
+python3 -c "from cuda import cudart; print('OK cudart')"
+python3 -c "import numpy; print('OK numpy', numpy.__version__)"
+python3 -c "import cv2; print('OK OpenCV', cv2.__version__)"
+python3 -c "import yaml; print('OK pyyaml')"
+```
+
+### 2d -- Full verification (run all at once)
+
+```bash
+python3 - <<'EOF'
+checks = [
+    ("pyds",            "import pyds"),
+    ("tensorrt",        "import tensorrt as trt; print(trt.__version__)"),
+    ("cuda.cudart",     "from cuda import cudart"),
+    ("numpy",           "import numpy"),
+    ("opencv",          "import cv2"),
+    ("pyyaml",          "import yaml"),
+    ("GStreamer",       "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst"),
+    ("GstRtspServer",  "import gi; gi.require_version('GstRtspServer','1.0'); from gi.repository import GstRtspServer"),
+]
+for name, code in checks:
+    try:
+        exec(code)
+        print(f"  OK  {name}")
+    except Exception as e:
+        print(f"  FAIL {name}: {e}")
+EOF
+```
+
+All 8 lines must print `OK`. Any `FAIL` entry must be resolved before running the app.
 
 ---
 

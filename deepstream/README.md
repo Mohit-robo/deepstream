@@ -56,20 +56,71 @@ SUTrack/
 
 ## Dependencies
 
+### 1. System: JetPack 5.x + DeepStream SDK
+
+Verify your JetPack and DeepStream versions first:
+
 ```bash
-# DeepStream Python bindings (pre-installed with JetPack)
+# JetPack version
+cat /etc/nv_tegra_release
+
+# DeepStream SDK version (must succeed)
+deepstream-app --version-all
+```
+
+If `deepstream-app` is missing, install DeepStream:
+
+```bash
+sudo apt-get install -y deepstream-7.0
+# or deepstream-6.4 depending on your JetPack version
+```
+
+### 2. System packages (GStreamer + RTSP server)
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    python3-gi python3-gst-1.0 \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-rtsp \
+    libgstrtspserver-1.0-dev \
+    gir1.2-gst-rtsp-server-1.0
+```
+
+### 3. DeepStream Python bindings (pyds)
+
+```bash
+# Locate the wheel (path varies by DeepStream version)
+find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null
+
+# Install it
 pip install /opt/nvidia/deepstream/deepstream/lib/pyds-*.whl
+```
 
-# Runtime Python deps (no PyTorch required)
+### 4. Python packages (no PyTorch required)
+
+```bash
 pip install numpy opencv-python pyyaml cuda-python
-
-# GStreamer Python
-sudo apt-get install python3-gi python3-gst-1.0 \
-    gstreamer1.0-tools gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good
 ```
 
 > TensorRT and CUDA are pre-installed with JetPack and do not require separate installation.
+
+### 5. Verify all components
+
+```bash
+python -c "import pyds; print('OK pyds')"
+python -c "from cuda import cudart; print('OK cudart')"
+python -c "import tensorrt as trt; print('OK TRT', trt.__version__)"
+python -c "import numpy; print('OK numpy', numpy.__version__)"
+python -c "import cv2; print('OK OpenCV', cv2.__version__)"
+python -c "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; print('OK GStreamer')"
+python -c "import gi; gi.require_version('GstRtspServer','1.0'); from gi.repository import GstRtspServer; print('OK GstRtspServer')"
+```
+
+All 7 lines must print `OK`. See [docs/usage.md](docs/usage.md) for troubleshooting if any fail.
 
 ---
 

@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Installation — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html">
+      <span class="nav-icon">🏠</span> Overview
+    </a>
+    <a href="install.html" class="active">
+      <span class="nav-icon">📦</span> Installation
+    </a>
+    <a href="pipeline.html">
+      <span class="nav-icon">🎬</span> GStreamer Pipeline
+    </a>
+    <a href="engine.html">
+      <span class="nav-icon">⚡</span> TensorRT Engine
+    </a>
+    <a href="tracker-logic.html">
+      <span class="nav-icon">🎯</span> Tracker Logic
+    </a>
+    <a href="multi-object.html">
+      <span class="nav-icon">👥</span> Multi-Object Manager
+    </a>
+    <a href="pgie.html">
+      <span class="nav-icon">🖱️</span> PGIE Click-to-Select
+    </a>
+  </nav>
+
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#requirements"><span class="nav-icon">📋</span> System Requirements</a>
+    <a href="#step1"><span class="nav-icon">1️⃣</span> Step 1 — Verify Base System</a>
+    <a href="#step2"><span class="nav-icon">2️⃣</span> Step 2 — apt packages</a>
+    <a href="#step3"><span class="nav-icon">3️⃣</span> Step 3 — pyds Wheel</a>
+    <a href="#step4"><span class="nav-icon">4️⃣</span> Step 4 — Python Packages</a>
+    <a href="#step5"><span class="nav-icon">5️⃣</span> Step 5 — Full Verify</a>
+    <a href="#engine"><span class="nav-icon">⚡</span> Step 6 — Build Engine</a>
+    <a href="#troubleshoot"><span class="nav-icon">🔧</span> Troubleshooting</a>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ CONTENT -->
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">📦 Setup</div>
+    <h1>Installation Guide</h1>
+    <p>
+      Complete step-by-step installation from a bare JetPack image to a running
+      DeepStream SUTrack app. No PyTorch required at runtime.
+    </p>
+  </div>
+
+  <!-- ── System Requirements ────────────────────────────── -->
+  <h2 id="requirements">System Requirements</h2>
+
+  <table>
+    <thead>
+      <tr><th>Component</th><th>Requirement</th><th>How Installed</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Hardware</strong></td>
+        <td>NVIDIA Jetson (Orin / Xavier / AGX Xavier)</td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td><strong>JetPack</strong></td>
+        <td>5.x (L4T r35 or r36)</td>
+        <td>SDK Manager / SDKM flash</td>
+      </tr>
+      <tr>
+        <td><strong>DeepStream SDK</strong></td>
+        <td>6.x or 7.x (must match JetPack)</td>
+        <td><code>apt-get install deepstream-7.0</code></td>
+      </tr>
+      <tr>
+        <td><strong>Python</strong></td>
+        <td>3.8 – 3.10</td>
+        <td>Pre-installed with JetPack</td>
+      </tr>
+      <tr>
+        <td><strong>TensorRT</strong></td>
+        <td>>= 8.5</td>
+        <td>Pre-installed with JetPack</td>
+      </tr>
+      <tr>
+        <td><strong>CUDA</strong></td>
+        <td>>= 11.4</td>
+        <td>Pre-installed with JetPack</td>
+      </tr>
+      <tr>
+        <td><strong>pyds</strong></td>
+        <td>Matching DeepStream version</td>
+        <td><code>pip install pyds-*.whl</code> — <a href="#step3">Step 3</a></td>
+      </tr>
+      <tr>
+        <td><strong>GStreamer + RTSP</strong></td>
+        <td>>= 1.14</td>
+        <td><code>apt-get</code> — <a href="#step2">Step 2</a></td>
+      </tr>
+      <tr>
+        <td><strong>cuda-python</strong></td>
+        <td>>= 11.7</td>
+        <td><code>pip install cuda-python</code> — <a href="#step4">Step 4</a></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Step 1 ──────────────────────────────────────────── -->
+  <h2 id="step1">Step 1 — Verify Your Base System</h2>
+  <p>
+    Run these checks before installing anything to confirm JetPack, DeepStream, and
+    TensorRT are already present on your Jetson.
+  </p>
+
+  <pre><code><span class="cm"># Show JetPack / L4T version (should print something like "# R35 (release), REVISION: 4.1")</span>
+cat /etc/nv_tegra_release
+
+<span class="cm"># Confirm DeepStream is installed and operational</span>
+deepstream-app --version-all
+
+<span class="cm"># Confirm Python version (must be 3.8 – 3.10)</span>
+python3 --version
+
+<span class="cm"># Confirm TensorRT (bundled with JetPack — no separate install needed)</span>
+python3 -c "import tensorrt as trt; print('TRT', trt.__version__)"
+
+<span class="cm"># Confirm CUDA (bundled with JetPack)</span>
+nvcc --version</code></pre>
+
+  <div class="callout note">
+    <div class="callout-title">DeepStream Not Found?</div>
+    If <code>deepstream-app</code> is missing, install it:
+    <pre style="margin-top:0.5rem"><code>sudo apt-get install -y deepstream-7.0
+<span class="cm"># or deepstream-6.4 depending on your JetPack version</span></code></pre>
+    Then re-run <code>deepstream-app --version-all</code> to confirm.
+  </div>
+
+  <!-- ── Step 2 ──────────────────────────────────────────── -->
+  <h2 id="step2">Step 2 — System Packages (GStreamer + RTSP Server)</h2>
+  <p>
+    Install GStreamer Python bindings, plugin packs, and the GstRtspServer library.
+    The RTSP server library (<code>gir1.2-gst-rtsp-server-1.0</code>) is required for
+    Phase 5+ RTSP streaming and is easy to forget.
+  </p>
+
+  <pre><code>sudo apt-get update
+sudo apt-get install -y \
+    python3-gi \
+    python3-gst-1.0 \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-rtsp \
+    libgstrtspserver-1.0-dev \
+    gir1.2-gst-rtsp-server-1.0</code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Package</th><th>Why It Is Needed</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>python3-gi</code></td><td>GObject Introspection — lets Python call GStreamer C libraries</td></tr>
+      <tr><td><code>python3-gst-1.0</code></td><td>GStreamer Python overrides (Gst.init, Gst.Pipeline, etc.)</td></tr>
+      <tr><td><code>gstreamer1.0-tools</code></td><td><code>gst-launch-1.0</code>, <code>gst-inspect-1.0</code> for debugging</td></tr>
+      <tr><td><code>gstreamer1.0-plugins-base/good/bad</code></td><td>Core demuxers, decoders, and muxers</td></tr>
+      <tr><td><code>gstreamer1.0-rtsp</code></td><td>RTSP client plugin (<code>rtspsrc</code>) for RTSP input sources</td></tr>
+      <tr><td><code>libgstrtspserver-1.0-dev</code></td><td>C headers — required to build the GObject Introspection data</td></tr>
+      <tr><td><code>gir1.2-gst-rtsp-server-1.0</code></td><td><strong>Python bindings for <code>GstRtspServer</code></strong> — required to create an RTSP server in Python</td></tr>
+    </tbody>
+  </table>
+
+  <p>Verify:</p>
+  <pre><code>python3 -c "
+import gi
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer
+Gst.init(None)
+print('OK GStreamer', Gst.version_string())
+print('OK GstRtspServer')
+"</code></pre>
+
+  <!-- ── Step 3 ──────────────────────────────────────────── -->
+  <h2 id="step3">Step 3 — DeepStream Python Bindings (pyds)</h2>
+  <p>
+    <code>pyds</code> is the Python API for reading and writing DeepStream metadata
+    (<code>NvDsFrameMeta</code>, <code>NvDsObjectMeta</code>, etc.). It ships as a
+    pre-built wheel inside the DeepStream SDK installation.
+  </p>
+
+  <pre><code><span class="cm"># Locate the wheel (path includes DS version number)</span>
+find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null
+
+<span class="cm"># Install — the glob expands to the correct versioned filename</span>
+pip install /opt/nvidia/deepstream/deepstream/lib/pyds-*.whl</code></pre>
+
+  <div class="callout note">
+    <div class="callout-title">Wheel Not Found?</div>
+    If the wheel is missing, your DeepStream SDK installation may be incomplete.
+    Common fix:
+    <pre style="margin-top:0.5rem"><code>sudo apt-get install --reinstall deepstream-7.0</code></pre>
+    Then search again with <code>find /opt/nvidia/deepstream -name "pyds*.whl"</code>.
+  </div>
+
+  <p>Verify:</p>
+  <pre><code>python3 -c "import pyds; print('OK pyds')"</code></pre>
+
+  <!-- ── Step 4 ──────────────────────────────────────────── -->
+  <h2 id="step4">Step 4 — Python Runtime Packages</h2>
+  <p>
+    These are the only Python packages that need to be installed via <code>pip</code>.
+    PyTorch is <strong>not required</strong> at runtime — all tracker preprocessing uses
+    pure NumPy.
+  </p>
+
+  <pre><code>pip install numpy opencv-python pyyaml cuda-python</code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Package</th><th>Tested Version</th><th>Why It Is Needed</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>numpy</code></td>
+        <td>>= 1.21</td>
+        <td>All tracker preprocessing (crop, normalize, hann window, argmax) is pure NumPy</td>
+      </tr>
+      <tr>
+        <td><code>opencv-python</code></td>
+        <td>>= 4.5</td>
+        <td>ROI selection window (<code>selectROI</code>), RGBA → BGR color conversion, PGIE click-to-select overlay</td>
+      </tr>
+      <tr>
+        <td><code>pyyaml</code></td>
+        <td>>= 5.4</td>
+        <td>Load <code>tracker_config.yml</code> at startup</td>
+      </tr>
+      <tr>
+        <td><code>cuda-python</code></td>
+        <td>>= 11.7</td>
+        <td><code>cuda.cudart</code> API — allocates pinned host + device buffers and drives TRT inference. Replaces <code>pycuda</code> for better Jetson compatibility.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout note">
+    <div class="callout-title">Why cuda-python instead of pycuda?</div>
+    <code>pycuda</code> requires a compiler and often fails on Jetson due to architecture
+    mismatches. <code>cuda-python</code> is a thin ctypes wrapper around the CUDA runtime
+    library (<code>libcudart.so</code>) that is already installed with JetPack — no compiler needed.
+  </div>
+
+  <p>Verify:</p>
+  <pre><code>python3 -c "from cuda import cudart; print('OK cudart')"
+python3 -c "import numpy; print('OK numpy', numpy.__version__)"
+python3 -c "import cv2; print('OK OpenCV', cv2.__version__)"
+python3 -c "import yaml; print('OK pyyaml')"</code></pre>
+
+  <!-- ── Step 5 ──────────────────────────────────────────── -->
+  <h2 id="step5">Step 5 — Full Verification</h2>
+  <p>
+    Run this script to check all 8 dependencies at once. Every line must print
+    <code>OK</code>. Any <code>FAIL</code> must be fixed before running the app.
+  </p>
+
+  <pre><code>python3 - &lt;&lt;'EOF'
+checks = [
+    ("pyds",           "import pyds"),
+    ("tensorrt",       "import tensorrt as trt; print(trt.__version__, end='')"),
+    ("cuda.cudart",    "from cuda import cudart"),
+    ("numpy",          "import numpy"),
+    ("opencv",         "import cv2"),
+    ("pyyaml",         "import yaml"),
+    ("GStreamer",      "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; Gst.init(None)"),
+    ("GstRtspServer",  "import gi; gi.require_version('GstRtspServer','1.0'); from gi.repository import GstRtspServer"),
+]
+for name, code in checks:
+    try:
+        exec(code)
+        print(f"  OK  {name}")
+    except Exception as e:
+        print(f"  FAIL {name}: {e}")
+EOF</code></pre>
+
+  <p>Expected output:</p>
+  <pre><code>  OK  pyds
+  OK  tensorrt  8.x.x
+  OK  cuda.cudart
+  OK  numpy
+  OK  opencv
+  OK  pyyaml
+  OK  GStreamer
+  OK  GstRtspServer</code></pre>
+
+  <!-- ── Step 6 ──────────────────────────────────────────── -->
+  <h2 id="engine">Step 6 — Build the TensorRT Engine (one time only)</h2>
+  <p>
+    The app requires a compiled <code>sutrack_fp32.engine</code> file at the repo root.
+    This step is only needed once per Jetson device — TRT engines are not portable across
+    different GPU architectures.
+  </p>
+
+  <h3>Option A — Build from ONNX (requires full SUTrack repo)</h3>
+  <pre><code><span class="cm"># From the SUTrack repo root</span>
+cd ~/SUTrack
+
+<span class="cm"># Export the ONNX model (requires PyTorch + SUTrack dependencies)</span>
+python tracking/export_onnx.py --param sutrack_t224
+
+<span class="cm"># Compile the TRT engine (FP32 -- do NOT add --fp16)</span>
+bash deepstream/scripts/build_engine.sh sutrack.onnx sutrack_fp32.engine</code></pre>
+
+  <h3>Option B — Copy a Pre-Built Engine</h3>
+  <p>
+    If you already have a compiled engine from another session or machine with the
+    <strong>same GPU architecture</strong>, copy it to the repo root:
+  </p>
+  <pre><code>cp /path/to/sutrack_fp32.engine ~/SUTrack/sutrack_fp32.engine</code></pre>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical: FP32 Only — Never Use --fp16</div>
+    The SUTrack decoder relies on sigmoid activations throughout. In FP16 precision,
+    these underflow to near zero — the tracker sees no response peaks and outputs a
+    broken, wandering bounding box. Always build without <code>--fp16</code>.
+  </div>
+
+  <p>Verify the engine file exists and is non-zero:</p>
+  <pre><code>ls -lh ~/SUTrack/sutrack_fp32.engine
+<span class="cm"># Expected: -rw-r--r-- 1 phoenix phoenix  ~52M  sutrack_fp32.engine</span></code></pre>
+
+  <p>Optionally load it to confirm TRT can parse it:</p>
+  <pre><code>python3 - &lt;&lt;'EOF'
+import tensorrt as trt
+logger = trt.Logger(trt.Logger.WARNING)
+with open("sutrack_fp32.engine", "rb") as f:
+    rt = trt.Runtime(logger)
+    engine = rt.deserialize_cuda_engine(f.read())
+print(f"OK engine — {engine.num_bindings} bindings")
+EOF</code></pre>
+
+  <!-- ── Troubleshooting ─────────────────────────────────── -->
+  <h2 id="troubleshoot">Troubleshooting</h2>
+
+  <table>
+    <thead>
+      <tr><th>Symptom</th><th>Likely Cause</th><th>Fix</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ModuleNotFoundError: pyds</code></td>
+        <td>Wheel not installed</td>
+        <td><code>pip install /opt/nvidia/deepstream/.../pyds-*.whl</code> — see <a href="#step3">Step 3</a></td>
+      </tr>
+      <tr>
+        <td><code>ModuleNotFoundError: No module named 'gi'</code></td>
+        <td>python3-gi not installed</td>
+        <td><code>sudo apt-get install python3-gi python3-gst-1.0</code></td>
+      </tr>
+      <tr>
+        <td><code>ValueError: Namespace GstRtspServer not available</code></td>
+        <td>GIR bindings for RTSP server missing</td>
+        <td><code>sudo apt-get install gir1.2-gst-rtsp-server-1.0</code></td>
+      </tr>
+      <tr>
+        <td><code>ImportError: cuda-python</code> or <code>from cuda import cudart</code> fails</td>
+        <td>cuda-python not installed</td>
+        <td><code>pip install cuda-python</code></td>
+      </tr>
+      <tr>
+        <td><code>deepstream-app: command not found</code></td>
+        <td>DeepStream SDK not installed</td>
+        <td><code>sudo apt-get install deepstream-7.0</code> (match your JetPack)</td>
+      </tr>
+      <tr>
+        <td>pyds wheel not found at <code>/opt/nvidia/deepstream/...</code></td>
+        <td>Incomplete DeepStream install</td>
+        <td><code>sudo apt-get install --reinstall deepstream-7.0</code> then search again</td>
+      </tr>
+      <tr>
+        <td><code>import cv2</code> fails</td>
+        <td>opencv-python not installed or wrong variant</td>
+        <td><code>pip install opencv-python</code>. On headless servers also try <code>opencv-python-headless</code></td>
+      </tr>
+      <tr>
+        <td>TRT engine loads but gives wrong output</td>
+        <td>Engine built with <code>--fp16</code></td>
+        <td>Rebuild without <code>--fp16</code> — see <a href="#engine">Step 6</a></td>
+      </tr>
+      <tr>
+        <td>Engine loads but binding count is wrong</td>
+        <td>Old engine from different model variant</td>
+        <td>Rebuild from <code>sutrack_t224</code> ONNX. Expected: 3 inputs + 3 outputs = 6 bindings</td>
+      </tr>
+      <tr>
+        <td>RTSP stream never starts (<code>rtsp_enabled: true</code>)</td>
+        <td><code>gir1.2-gst-rtsp-server-1.0</code> missing</td>
+        <td><code>sudo apt-get install gir1.2-gst-rtsp-server-1.0 libgstrtspserver-1.0-dev</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Next Step ──────────────────────────────────────── -->
+  <h2>Next Steps</h2>
+  <p>
+    Once all verification commands pass, continue with the
+    <a href="index.html#quickstart">Quick Start</a> or the full run guide in
+    <a href="../usage.md">docs/usage.md</a>.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem">
+    <a href="index.html#quickstart" class="card" style="text-decoration:none">
+      <div class="card-title">🚀 Quick Start</div>
+      <div class="card-body">Build engine and run the Phase 6 app in 3 commands.</div>
+    </a>
+    <a href="pipeline.html" class="card" style="text-decoration:none">
+      <div class="card-title">🎬 Pipeline Internals</div>
+      <div class="card-body">How the GStreamer pipeline is constructed and how the pad probe works.</div>
+    </a>
+  </div>
+
+</main>
+</body>
+</html>
