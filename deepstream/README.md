@@ -18,11 +18,13 @@ python tracking/export_onnx.py --param sutrack_t224
 # 2. Compile TRT engine (one-time)
 bash deepstream/scripts/build_engine.sh sutrack.onnx sutrack_fp32.engine
 
-# 3. Run tracker (requires display context for GPU conversion)
+# 3. Run tracker (requires display context for PGIE selection)
 export DISPLAY=:0
-python deepstream/apps/deepstream_tracker_app.py \
+python deepstream/apps/deepstream_rtsp_app.py \
     --config deepstream/configs/tracker_config.yml
 ```
+
+> **Phase 6 Feature:** On startup, click any detected box in the "Click-to-Select" window to initialize tracking. The detector then automatically optimizes itself to save power.
 
 ---
 
@@ -33,7 +35,9 @@ SUTrack/
 ├── sutrack.onnx                         # ONNX export (repo root)
 ├── sutrack_fp32.engine                  # TRT engine (repo root)
 └── deepstream/
-    ├── apps/deepstream_tracker_app.py   # Main entry point
+    ├── apps/
+    │   ├── deepstream_rtsp_app.py       # Current production app (OSD + RTSP + PGIE)
+    │   └── deepstream_tracker_app.py    # Legacy appsink app
     ├── tracker/
     │   ├── sutrack_engine.py            # TRT load + inference (cuda.cudart)
     │   ├── tracker_instance.py          # Per-object state + track()
@@ -41,9 +45,9 @@ SUTrack/
     │   └── tracker_utils.py             # Pure-NumPy: preprocess, crop, hann2d, IoU
     ├── configs/
     │   ├── tracker_config.yml           # All tunable parameters
-    │   └── pgie_config.txt              # Detector config (Phase 4.3+)
+    │   └── pgie_config.txt              # Primary detector config
     ├── scripts/build_engine.sh          # trtexec wrapper with correct shape flags
-    └── docs/
+    └── docs/                            # Markdown and HTML documentation
         ├── usage.md                     # Full usage guide
         └── architecture.md              # Pipeline diagram + design decisions
 ```

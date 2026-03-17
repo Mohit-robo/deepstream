@@ -416,3 +416,51 @@ finally:
 **Fix:** Use a `threading.Event` to physically **block** the GStreamer probe thread after it captures the first frame. The stream will "freeze" exactly at the point of capture and only resume after the main thread signals that the selection is complete.
 
 **Rule:** Use `Event.wait()` inside a pad probe to force-synchronize human interaction with real-time streaming threads.
+
+---
+
+## Lesson 27 - Metadata cleanup required after one-shot PGIE detection
+
+**Context:** Using a PGIE detector only for the first frame to enable "Click-to-Select" ROI.
+
+**Mistake:** Assuming that filtering the selection logic in Python would hide the detector's boxes.
+
+**Root cause:** DeepStream's `nvinfer` (PGIE) continues to run and attach bounding boxes (in its own thread) to every frame. Even if Python ignores them, the downstream `nvdsosd` element will automatically draw every box it finds in the metadata.
+
+**Fix:** Inside the `tracker_probe`, explicitly clear the `obj_meta_list` using `pyds.nvds_remove_obj_meta_from_frame` for all frames after initialization.
+
+**Rule:** If a detector is used for initialization only, its metadata must be explicitly stripped from the pipeline after selection to prevent "distraction" boxes from appearing on the stream.
+
+---
+
+## Lesson 28 - Dynamically increase PGIE interval for "One-Shot" power-save
+
+**Context:** Reducing GPU load once a detector's task is done.
+
+**Mistake:** Letting the detector run at `interval=0` for the entire session.
+
+**Root cause:** Running a PGIE (like ResNet-10) on every frame consumes significant GPU cycles and power, even if the results are being discarded/hidden.
+
+**Fix:** Store a reference to the `nvinfer` GSt element and set its `interval` property to a very high number (e.g., 10,000) as soon as the tracker is initialized. This effectively pauses the detector without needing a pipeline state change.
+
+**Rule:** Always optimize "initialization-only" elements by dynamically adjusting their properties to a "sleep" state once they are no longer needed.
+
+---
+
+## Lesson 29 - Detectors can attach info to both obj_meta and display_meta
+
+**Context:** Cleaning up metadata to ensure a single-object output.
+
+**Mistake:** Only clearing `obj_meta_list`.
+
+**Root cause:** Some detectors or GIE configurations attach text labels or analytics to `display_meta_list` instead of (or in addition to) the bounding box in `obj_meta_list`. If only one is cleared, "ghost" labels or confidence scores might persist.
+
+**Fix:** Clear both lists in the probe:
+```python
+while frame_meta.obj_meta_list:
+    pyds.nvds_remove_obj_meta_from_frame(frame_meta, ...)
+while frame_meta.display_meta_list:
+    pyds.nvds_remove_display_meta_from_frame(frame_meta, ...)
+```
+
+**Rule:** When stripping metadata for a clean output, always check and clear both `obj_meta_list` and `display_meta_list`.

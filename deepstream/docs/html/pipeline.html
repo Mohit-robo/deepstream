@@ -23,27 +23,148 @@
     <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
     <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
     <a href="multi-object.html"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+    <a href="pgie.html"><span class="nav-icon">&#128433;</span> PGIE Click-to-Select</a>
   </nav>
   <div class="sidebar-section">On This Page</div>
   <nav>
-    <a href="#gstreamer"><span class="nav-icon">&#10067;</span> What is GStreamer?</a>
-    <a href="#build-pipeline"><span class="nav-icon">&#128295;</span> Building the Pipeline</a>
-    <a href="#buffer-convert"><span class="nav-icon">&#128260;</span> Buffer Conversion</a>
-    <a href="#app-state"><span class="nav-icon">&#128190;</span> AppState</a>
-    <a href="#callback"><span class="nav-icon">&#128225;</span> Appsink Callback</a>
-    <a href="#main"><span class="nav-icon">&#9654;</span> Main Function</a>
+    <a href="#phase6"><span class="nav-icon">&#127919;</span> Phase 6 Pipeline</a>
+    <a href="#probe"><span class="nav-icon">&#128225;</span> Pad Probe Logic</a>
+    <a href="#rtsp"><span class="nav-icon">&#128246;</span> RTSP Streaming</a>
+    <a href="#gstreamer"><span class="nav-icon">&#10067;</span> Phase 4 (Legacy)</a>
   </nav>
 </aside>
 
 <main class="content">
 
   <div class="page-header">
-    <div class="page-badge">&#127909; apps/deepstream_tracker_app.py</div>
+    <div class="page-badge">&#127909; apps/deepstream_rtsp_app.py</div>
     <h1>GStreamer Pipeline</h1>
-    <p>How video flows from a file or camera through DeepStream into Python, how each frame becomes a NumPy array, and how tracking results get drawn and saved.</p>
+    <p>How video flows from a file or camera through DeepStream. Covers both the current Phase 6 NvDsOsd+RTSP pipeline and the legacy Phase 4 appsink pipeline.</p>
   </div>
 
-  <h2 id="gstreamer">What is GStreamer?</h2>
+  <h2 id="phase6">Phase 6 Pipeline — NvDsOsd + RTSP + PGIE (Current)</h2>
+  <p>
+    The recommended application is <code>deepstream_rtsp_app.py</code>. It uses a native
+    DeepStream pad probe instead of appsink, draws boxes via <code>nvdsosd</code> in GPU memory,
+    and streams output over RTSP using hardware H.264 encoding.
+  </p>
+
+  <div class="diagram"><span class="d-title">PHASE 6 PIPELINE (deepstream_rtsp_app.py)</span>
+
+  filesrc / v4l2src / uridecodebin
+       |
+  decodebin  (hardware nvv4l2decoder on Jetson)
+       |
+  nvvideoconvert  compute-hw=1       VIC: NVMM → NVMM RGBA (no EGL context)
+       |
+  nvstreammux  batch-size=1  width=1280  height=720
+       |
+  nvinfer  config-file-path=pgie_config.txt   [Phase 6: optional PGIE detector]
+       |    ResNet-10 INT8; writes NvDsObjectMeta detections into frame metadata
+       |
+  nvvideoconvert  compute-hw=1       bridge required between nvinfer → nvdsosd
+       |
+  nvdsosd  process-mode=0
+       |
+       | ← PAD PROBE fires on sink pad (Python tracker_probe callback):
+       |   - frame 0: capture RGBA frame + read PGIE detections from obj_meta_list
+       |              state.frame_ready.set()     signal main thread
+       |              state.init_done.wait()      block until ROI is selected
+       |   - frame 1+: cv.cvtColor RGBA→RGB
+       |               TrackerManager.update()
+       |               write NvDsObjectMeta bbox + label per tracked object
+       |
+       +──── queue ──── nvvideoconvert(hw=1) ──── nv3dsink   [local display]
+       |
+       └──── queue ──── nvvideoconvert(hw=1) ──── nvv4l2h264enc
+                                                        |
+                                                  rtph264pay
+                                                        |
+                                                  udpsink  port=5400
+
+  GstRtspServer  port=8554:
+      udpsrc(5400) → rtsp://&lt;jetson-ip&gt;:8554/sutrack</div>
+
+  <h2 id="probe">Pad Probe Logic — <code>tracker_probe()</code></h2>
+  <p>
+    The pad probe is attached to the <strong>sink pad of <code>nvdsosd</code></strong>.
+    It fires after <code>nvinfer</code> has already populated frame metadata, but before
+    <code>nvdsosd</code> renders the frame. This ordering ensures PGIE detections are
+    available when the probe reads them on frame 0.
+  </p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>First Frame — Capture &amp; Signal</h4>
+        <p>
+          On frame 0, the probe calls <code>pyds.get_nvds_buf_surface()</code> to get an RGBA
+          NumPy array, reads all <code>NvDsObjectMeta</code> entries from <code>obj_meta_list</code>
+          (populated by <code>nvinfer</code>), stores them in <code>state.first_frame_detections</code>,
+          and calls <code>state.frame_ready.set()</code> to wake the main thread.
+          Then it blocks on <code>state.init_done.wait()</code> until ROI selection is complete.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Main Thread — ROI Selection (while probe waits)</h4>
+        <p>
+          The main thread waits on <code>state.frame_ready.wait()</code>, then calls
+          <code>select_bbox_click_to_select()</code> or <code>manual_roi_select()</code>
+          (see <a href="pgie.html">PGIE page</a>). All OpenCV GUI calls happen here — never
+          inside the probe (Lesson 25). Once a box is selected, <code>state.init_done.set()</code>
+          unblocks the probe.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Subsequent Frames — Track &amp; Draw</h4>
+        <p>
+          The probe converts the RGBA frame to RGB, calls <code>TrackerManager.update()</code>,
+          and for each returned bounding box acquires an <code>NvDsObjectMeta</code> from the pool,
+          fills <code>rect_params</code> and <code>text_params</code>, and adds it to the frame.
+          <code>nvdsosd</code> then renders these boxes in GPU memory before the tee.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout rule">
+    <div class="callout-title">Lesson 25 — OpenCV GUI in Main Thread Only</div>
+    <code>cv2.namedWindow</code>, <code>cv2.imshow</code>, <code>cv2.setMouseCallback</code>, and
+    <code>cv2.selectROI</code> must never be called inside a GStreamer pad probe. The probe runs
+    in a GStreamer streaming thread; Qt requires GUI calls on the main thread.
+    Use <code>threading.Event</code> to synchronize (Lesson 26).
+  </div>
+
+  <h2 id="rtsp">RTSP Streaming</h2>
+  <p>
+    After <code>nvdsosd</code>, a <code>tee</code> element splits the stream into two branches.
+    The RTSP branch encodes with <code>nvv4l2h264enc</code> (Jetson NVENC hardware block) and
+    sends RTP packets to a <code>udpsink</code> on port 5400. A <code>GstRtspServer</code>
+    instance wraps a <code>udpsrc</code> media factory and serves the combined stream at
+    <code>rtsp://&lt;jetson-ip&gt;:8554/sutrack</code>.
+  </p>
+  <p>
+    The display branch tries <code>nv3dsink</code> (Jetson-native, no EGL copy) first, falling
+    back to <code>nveglglessink</code> with a <code>nvvideoconvert(compute-hw=1)</code> bridge
+    to avoid the NVMM surface array crash (Lesson 24).
+  </p>
+
+  <div class="callout info">
+    <div class="callout-title">Headless / SSH Mode</div>
+    Set <code>pipeline.headless: true</code> in <code>tracker_config.yml</code>.
+    The display branch connects to <code>fakesink</code> instead of <code>nv3dsink</code>.
+    No <code>DISPLAY</code> environment variable is needed. All output goes to the RTSP stream.
+    Combine with <code>tracker.static_roi</code> for fully unattended operation.
+  </div>
+
+  <h2 id="gstreamer">Phase 4 (Legacy) — What is GStreamer?</h2>
   <p>
     GStreamer is a media framework that chains together <strong>elements</strong> like LEGO bricks
     to form a <strong>pipeline</strong>. Each element does one job: reading a file, decoding video,

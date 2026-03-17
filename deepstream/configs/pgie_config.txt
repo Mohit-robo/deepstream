@@ -1,25 +1,46 @@
-# DeepStream PGIE (Primary GIE) Config — Phase 4.3 placeholder
-# Fill in model-engine-file and labelfile-path for your detector before use.
+# DeepStream PGIE (Primary GIE) Config — Phase 6 ResNet-10
+#
+# Uses the standard DeepStream ResNet-10 4-class detector (Car, Bicycle, Person, Roadsign).
+# The INT8 batch-1 engine is pre-built at the path below.
+#
+# To use a different detector, replace model-file, proto-file, model-engine-file,
+# labelfile-path, and num-detected-classes accordingly.
 
 [property]
 gpu-id=0
+
+# Standard ResNet-10 4-class detector shipped with DeepStream SDK
 net-scale-factor=0.0039215697906911373
-model-engine-file=deepstream/models/detector.engine    # <-- set your detector TRT engine path here
-labelfile-path=deepstream/configs/labels.txt           # <-- set your class labels file here
+model-color-format=0
+model-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/resnet10.caffemodel
+proto-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/resnet10.prototxt
+# DS samples path (standard location)
+model-engine-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/resnet10.caffemodel_b1_gpu0_int8.engine
+labelfile-path=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/labels.txt
+int8-calib-file=/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/cal_trt.bin
+
+# Required output blob names for the ResNet-10 custom parser
+output-blob-names=conv2d_bbox;conv2d_cov/Sigmoid
+
+# Network settings
 batch-size=1
-network-mode=0                              # 0=FP32, 1=INT8, 2=FP16
-num-detected-classes=80                     # adjust to your model
+process-mode=1
+network-mode=1
+num-detected-classes=4
 interval=0
 gie-unique-id=1
-process-mode=1
-network-type=0                              # 0=Detector
+network-type=0
+
+# Clustering: DBSCAN
 cluster-mode=2
+force-implicit-batch-dim=1
 
 [class-attrs-all]
-threshold=0.25
-roi-top-offset=0
-roi-bottom-offset=0
-detected-min-w=0
-detected-min-h=0
-detected-max-w=0
-detected-max-h=0
+topk=20
+nms-iou-threshold=0.5
+pre-cluster-threshold=0.2
+
+[class-attrs-0]
+topk=20
+nms-iou-threshold=0.5
+pre-cluster-threshold=0.4

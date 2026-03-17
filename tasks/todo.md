@@ -52,10 +52,10 @@
 
 ### 4.3 Add Detector (PGIE)
 - [x] Create `deepstream/configs/pgie_config.txt` placeholder
-- [ ] Extend pipeline: `→ nvstreammux → nvinfer (PGIE) → pad probe`
-- [ ] Read `NvDsObjectMeta` detections in pad probe
-- [ ] Wire detections into `TrackerManager.update(detections=...)`
-- [ ] Test with multi-person video — verify stable IDs
+- [x] Extend pipeline: `→ nvstreammux → nvinfer (PGIE) → pad probe`
+- [x] Read `NvDsObjectMeta` detections in pad probe
+- [x] Wire detections into `TrackerManager.update(detections=...)`
+- [x] Test with multi-person video — verify stable IDs
 
 ---
 
@@ -68,16 +68,28 @@
 - [x] Add Phase 5 config keys to `tracker_config.yml` (width, height, rtsp_*)
 - [x] Fix `nveglglessink` NVMM surface array error — insert `nvvideoconvert(compute-hw=1)` bridge before display sink; try `nv3dsink` first
 - [x] Final validation: run on Jetson — confirmed OSD boxes on RTSP stream (Verified by user)
-- [ ] Add automated ROI init via standard PGIE detector (Phase 4.3 dependency)
+## ✅ Phase 6 — PGIE & Intelligent ROI Selection (Done)
+- [x] Create implementation plan for Phase 6 (`docs/phase_6_click_to_select_plan.md`)
+- [x] Add `nvinfer` (PGIE) element to RTSP app pipeline
+- [x] Configure `pgie_config.txt` with suitable detector (Peoplenet or ResNet)
+- [x] Capture first-frame detections in `tracker_probe`
+- [x] Implement `on_mouse_click` callback for object selection
+- [x] Implement "Click-to-Select" logic (box searching via pixel coordinates)
+- [x] Initialize tracker directly from the selected detected box
+- [x] Verification: Accurate hand-off from detector to SUTrack via GUI click
+onfig.yml`; `--pgie-config` and `--no-pgie` CLI args
+- [x] Graceful fallbacks: Q/ESC -> manual selectROI; no detections -> manual selectROI
+- [x] Verification: run on Jetson, confirm detector boxes appear, click-to-select works
+- [x] Phase 6.5: Dynamically increase PGIE interval for power-save optimization
+- [x] Phase 6.6: Aggressive metadata cleanup to ensure clean output stream
 
-
-
-## ✅ Phase 6 — Documentation & Lessons Update (Done)
+## ✅ Phase 7 — Documentation & Lessons Update (Ongoing)
 - [x] Write `docs/README.md` — quick start + directory structure
 - [x] Write `docs/usage.md` — full setup, run, CLI reference, troubleshooting
 - [x] Write `docs/architecture.md` — pipeline diagram and design decisions
 - [x] Document Lessons 20-21 (EGL context & NVMM memory bridges)
 - [x] Update documentation for RTSP/OSD v2 app (Phase 5 pipeline, CLI, config, troubleshooting)
+- [x] Update documentation for Phase 6 Click-to-Select ROI
 
 ---
 

@@ -22,6 +22,7 @@ pipeline:
   output_path: ""            # Phase 4 only: save annotated MP4 here; "" = display only
   headless: false            # true = no display window (Phase 5: use RTSP stream instead)
   log_level: INFO            # DEBUG / INFO / WARNING
+  pgie_config: configs/pgie_config.txt  # Phase 6: detector config
 
   # --- Phase 5: nvstreammux resolution (must match or be >= source resolution) ---
   width:  1280               # pipeline frame width  (nvstreammux output)
@@ -33,3 +34,9 @@ pipeline:
   rtsp_udp_port: 5400        # internal UDP port (pipeline -> RTSP server bridge)
   rtsp_path: /sutrack         # RTSP mount path  (e.g. rtsp://<ip>:8554/sutrack)
   rtsp_bitrate: 4000000      # H.264 target bitrate in bps (4 Mbps default)
+
+  # --- Phase 6: PGIE click-to-select ROI ---
+  # Path relative to deepstream/ directory; leave empty to disable PGIE.
+  # When set (and not headless), nvinfer runs on frame 0, shows detected boxes,
+  # and the user clicks one to initialize the tracker.
+  pgie_config: configs/pgie_config.txt

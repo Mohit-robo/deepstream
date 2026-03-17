@@ -15,9 +15,11 @@ We have successfully ported the SUTrack PyTorch model to a standalone, PyTorch-f
    - Verified FP32 precision for model accuracy.
 
 2. **[deepstream/](deepstream/)**: Production GStreamer pipeline integration.
+   - **Intelligent ROI Selection:** Click-to-select objects using integrated PGIE detectors (Phase 6).
+   - **RTSP Streaming:** Native H.264 broadcast of tracked streams (Phase 5).
    - **Multi-Object Tracking:** Manages multiple concurrent tracks with ID persistence.
+   - **One-Shot Optimization:** Dynamically disables detector overhead after ROI selection to save GPU cycles.
    - **Hardware Acceleration:** Uses VIC (`compute-hw=1`) or GPU (`compute-hw=0`) for color conversion.
-   - **Modular Design:** Separate Engine, Instance, and Manager classes.
 
 ---
 
@@ -43,7 +45,7 @@ We have successfully ported the SUTrack PyTorch model to a standalone, PyTorch-f
 ### 2. Run the App
 ```bash
 export DISPLAY=:0
-python deepstream/apps/deepstream_tracker_app.py --config deepstream/configs/tracker_config.yml
+python deepstream/apps/deepstream_rtsp_app.py --config deepstream/configs/tracker_config.yml
 ```
 
 ---

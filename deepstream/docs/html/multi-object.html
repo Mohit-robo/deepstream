@@ -23,6 +23,7 @@
     <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
     <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
     <a href="multi-object.html" class="active"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+    <a href="pgie.html"><span class="nav-icon">&#128433;</span> PGIE Click-to-Select</a>
   </nav>
   <div class="sidebar-section">On This Page</div>
   <nav>
@@ -301,12 +302,13 @@ matched_det_indices = set()
     <span class="kw">return</span> <span class="fn">len</span>(self.active_trackers)</code></pre>
 
   <div class="callout tip">
-    <div class="callout-title">Phase 4.3 — Adding a Detector</div>
-    To attach a PGIE detector (Phase 4.3), the pipeline is extended with
-    <code>nvinfer</code> and a pad probe that reads <code>NvDsObjectMeta</code> detection boxes.
-    Those boxes are passed as the <code>detections</code> argument to <code>update()</code>.
-    The IoU matching and spawn logic is already implemented — only the pipeline wiring
-    and probe code need to be added.
+    <div class="callout-title">Phase 6 — PGIE Detector Integrated</div>
+    Phase 6 added the <code>nvinfer</code> PGIE element to <code>deepstream_rtsp_app.py</code>.
+    The detector runs on the first frame to suggest bounding boxes; the user clicks one to
+    initialize <code>TrackerManager</code>. For subsequent frames, the detector's
+    <code>NvDsObjectMeta</code> boxes can be passed as the <code>detections</code> argument
+    to <code>update()</code> to refresh track lifetimes and spawn new trackers.
+    See <a href="pgie.html">PGIE Click-to-Select</a> for full details.
   </div>
 
   <div class="page-footer">

@@ -101,6 +101,11 @@ pipeline:
   rtsp_udp_port:  5400
   rtsp_path:      /sutrack
   rtsp_bitrate:   4000000   # H.264 target bitrate in bps
+
+  # Phase 6: PGIE click-to-select ROI
+  # Path relative to deepstream/ directory; leave empty or omit to disable.
+  # When set, nvinfer runs on frame 0 and shows detected boxes for user selection.
+  pgie_config: configs/pgie_config.txt
 ```
 
 Key parameter guide:
@@ -117,6 +122,7 @@ Key parameter guide:
 | `rtsp_enabled` | Enable RTSP stream output (Phase 5) | `true` |
 | `rtsp_port` | GstRtspServer listen port | `8554` |
 | `rtsp_bitrate` | H.264 encoder bitrate in bps | `4000000` |
+| `pgie_config` | Path to PGIE config file (relative to `deepstream/`). Enables click-to-select ROI on first frame. Empty = disabled. | `configs/pgie_config.txt` |
 
 ---
 
@@ -167,6 +173,53 @@ python deepstream/apps/deepstream_rtsp_app.py \
 ```
 
 A camera on `/dev/video0` is used. Set `static_roi` in the config for headless init.
+
+---
+
+### 5d -- Phase 6: PGIE Click-to-Select ROI (Recommended for interactive use)
+
+Ensure `pgie_config` is set in `tracker_config.yml` (default: `configs/pgie_config.txt`),
+then run normally:
+
+```bash
+export DISPLAY=:0    # required for OpenCV window on Jetson
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4
+```
+
+On the first frame, a window titled **"Click-to-Select Object"** opens with all detector
+boxes drawn in per-class colours. Click on the object you want to track. The SUTrack
+engine initialises on that box and begins tracking. The tracked green box appears on the
+RTSP stream immediately after selection.
+
+**GPU Optimization (One-Shot Detection):**
+To maximize performance, the PGIE detector automatically "goes to sleep" (sets `interval=10000`)
+immediately after an object is selected. This ensures zero detector overhead during active
+tracking while maintaining a low-latency pipeline.
+
+**ROI selection fallback chain:**
+1. `static_roi` set in config (or `--init_bbox` from CLI) → no window, headless
+2. PGIE detections found → click-to-select window (Phase 6)
+3. PGIE disabled (`--no-pgie`) or no detections found → manual draw-a-box window
+
+**Disable PGIE at runtime (keep config unchanged):**
+
+```bash
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --no-pgie
+```
+
+**Override PGIE config path:**
+
+```bash
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --pgie-config /custom/path/to/pgie_config.txt
+```
 
 ---
 
@@ -228,8 +281,10 @@ usage: deepstream_rtsp_app.py [--config CONFIG] [--input INPUT]
 |------|------|-------------|
 | `--config` | str | Path to `tracker_config.yml` |
 | `--input` | str | Video file, RTSP URL, or omit for camera |
+| `--pgie-config` | str | Override `pgie_config` path from YAML |
+| `--no-pgie` | flag | Disable PGIE at runtime regardless of config |
 
-ROI init and RTSP settings are controlled entirely via `tracker_config.yml`.
+All other ROI init and RTSP settings are controlled via `tracker_config.yml`.
 
 ### Phase 4 App (`deepstream_tracker_app.py`)
 
@@ -252,7 +307,20 @@ usage: deepstream_tracker_app.py [--config CONFIG] [--input INPUT]
 
 ## 8. Expected Output
 
-**Phase 5 console (during run):**
+**Phase 6 console (PGIE click-to-select):**
+```
+INFO  Engine loaded: /home/phoenix/SUTrack/sutrack_fp32.engine
+INFO  PGIE config: /home/phoenix/SUTrack/deepstream/configs/pgie_config.txt
+INFO  RTSP stream: rtsp://0.0.0.0:8554/sutrack
+INFO  Pipeline PLAYING
+INFO  PGIE detections on first frame: 3
+INFO  [click-to-select window opens -- user clicks]
+INFO  Selected bbox: [305, 198, 62, 180]
+INFO  Tracker initialized on object_id=0
+INFO  EOS -- frames=300  avg_fps=24.8
+```
+
+**Phase 5 console (static_roi or no PGIE):**
 ```
 INFO  Engine loaded: /home/phoenix/SUTrack/sutrack_fp32.engine
 INFO  Static ROI: [201, 294, 116, 288]
@@ -283,6 +351,8 @@ or OpenCV (Phase 4).
 | FPS summary (Jetson, Orin, FP32) | >= 25 FPS average |
 | RTSP stream (Phase 5) | VLC connects to `rtsp://<ip>:8554/sutrack`, boxes visible |
 | Latency (Phase 5) | < 200ms end-to-end measured from source to VLC |
+| PGIE click-to-select (Phase 6) | Window opens on frame 0 with detection boxes; clicking initializes tracker |
+| PGIE fallback (no detections) | Falls back to manual `selectROI` without crash |
 | No PyTorch imported | `python -c "import deepstream.tracker.tracker_utils; import sys; assert 'torch' not in sys.modules; print('OK')"` |
 
 ---
@@ -298,6 +368,10 @@ or OpenCV (Phase 4).
 | `eglglessink cannot handle NVRM surface array` | Missing nvvideoconvert bridge before display sink | Phase 5 app already inserts `conv_disp`; ensure you run `deepstream_rtsp_app.py`, not the Phase 4 app |
 | Pipeline dies after 3 frames, `h264parse` error | Cascade from display sink crash | See above -- NVMM surface bridge fix (Lesson 24) |
 | NULL window handler (`selectROI`) | Qt OpenCV initialization | Code already calls `imshow` before `selectROI`; ensure display is connected |
+| Click-to-select window does not open | `DISPLAY` not set | `export DISPLAY=:0` before running when connected to Jetson via SSH |
+| PGIE detections: 0 on first frame | Detector engine not compiled for this JetPack | Engine file `resnet10.caffemodel_b1_gpu0_int8.engine` must exist; run `deepstream-app --version-all` to confirm SDK is intact |
+| `nvinfer: Failed to create engine` | Wrong path in `pgie_config.txt` | Verify `model-engine-file` path exists: `ls /opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/` |
+| Click hits between boxes (no box selected) | Click point not inside any detection | Click directly on the object center; window stays open — try again |
 | `ModuleNotFoundError: pyds` | Python binding not installed | `pip install /opt/nvidia/deepstream/.../pyds-*.whl` |
 | `cannot import gi` / GStreamer missing | GObject not installed | `sudo apt-get install python3-gi python3-gst-1.0` |
 | FPS drops to 0.9 | PyTorch model in loop | Pure-NumPy `tracker_utils.py` must be used in the loop |
@@ -352,6 +426,6 @@ The pipeline skips `imshow` and uses VIC for all conversions.
 | `tracker/tracker_manager.py` | Multi-object lifecycle, IoU matching, stale removal |
 | `tracker/tracker_utils.py` | Pure-NumPy: `preprocess`, `sample_target`, `hann2d`, `iou` |
 | `configs/tracker_config.yml` | Runtime config (all tunable values, Phase 4 + 5) |
-| `configs/pgie_config.txt` | Detector config (Phase 4.3, PGIE -- future) |
+| `configs/pgie_config.txt` | DeepStream ResNet-10 INT8 detector config (Phase 6 click-to-select) |
 | `scripts/build_engine.sh` | Correct `trtexec` command with shape specs |
 | `docs/architecture.md` | Pipeline diagram + design decisions |

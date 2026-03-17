@@ -1,36 +1,47 @@
 """
-DeepStream SUTrack Tracker Application - Phase 5 (Native OSD + RTSP Streaming)
+DeepStream SUTrack Tracker Application - Phase 6 (PGIE Click-to-Select ROI)
 
-Pipeline:
+Pipeline (with PGIE enabled):
     filesrc / v4l2src
         -> decodebin
         -> nvvideoconvert (compute-hw=1, NVMM RGBA)
         -> nvstreammux
-        -> [Pad Probe: SUTrack inference + NvDsObjectMeta attachment]
+        -> nvinfer (PGIE: ResNet-10 detector, first-frame only)
+        -> nvvideoconvert (compute-hw=1)
+        -> [Pad Probe: read detections / SUTrack inference + NvDsObjectMeta]
         -> nvdsosd (GPU bounding box drawing)
         -> tee
-            Branch A: queue -> nveglglessink / fakesink  (local display)
+            Branch A: queue -> nvvideoconvert -> nv3dsink / fakesink  (local display)
             Branch B: queue -> nvvideoconvert -> nvv4l2h264enc
-                           -> rtph264pay -> udpsink      (RTSP feed)
+                           -> rtph264pay -> udpsink                   (RTSP feed)
     GstRtspServer wraps the UDP stream:
         rtsp://<jetson-ip>:8554/sutrack
 
-Changes from Phase 4 (appsink-based):
-  - Drawing: OpenCV cv2.rectangle removed; nvdsosd draws in GPU memory (zero-copy)
-  - Logic: pad probe instead of appsink callback; inline processing per frame
-  - Streaming: hardware H.264 via nvv4l2h264enc + GstRtspServer
-  - Headless: fakesink display branch; static_roi required (no GUI)
+ROI Initialization modes (in priority order):
+  1. static_roi in tracker_config.yml  -- fully headless, no GUI
+  2. --init_bbox X Y W H               -- headless via CLI
+  3. PGIE click-to-select (pgie_config in config or --pgie-config CLI)
+       - Detector runs on frame 0; detected boxes shown as colored overlays
+       - User LEFT-CLICKS on the object to track; smallest enclosing box wins ties
+       - Press Q/ESC to skip PGIE and fall back to mode 4
+  4. Manual selectROI                  -- draw a box with the mouse
+
+Changes from Phase 5:
+  - PGIE (nvinfer) added between nvstreammux and nvdsosd
+  - Detections from first frame captured in probe and stored in AppState
+  - New select_bbox_click_to_select() GUI function
+  - Main thread GUI flow: click-to-select -> manual-ROI fallback
+
+Usage (click-to-select):
+    python deepstream/apps/deepstream_rtsp_app.py \\
+        --config deepstream/configs/tracker_config.yml \\
+        --input /path/to/video.mp4
 
 Usage (headless, static ROI, RTSP):
     python deepstream/apps/deepstream_rtsp_app.py \\
         --config deepstream/configs/tracker_config.yml \\
         --input /path/to/video.mp4 \\
         --headless
-
-Usage (with local display):
-    python deepstream/apps/deepstream_rtsp_app.py \\
-        --config deepstream/configs/tracker_config.yml \\
-        --input /path/to/video.mp4
 
 View RTSP stream (on any machine on the same network):
     vlc rtsp://<jetson-ip>:8554/sutrack
@@ -39,7 +50,7 @@ Requirements:
     - DeepStream Python bindings (pyds)
     - gi.repository.GstRtspServer  (standard on JetPack)
     - sutrack_fp32.engine at repo root
-    - static_roi set in tracker_config.yml OR --init_bbox CLI arg
+    - deepstream/configs/pgie_config.txt pointing to a valid detector engine
 """
 
 # ---------------------------------------------------------------------------
@@ -92,6 +103,18 @@ from tracker.sutrack_engine import SUTrackEngine
 from tracker.tracker_manager import TrackerManager
 
 # ---------------------------------------------------------------------------
+# Per-class box colors (BGR for OpenCV) used in the click-to-select GUI
+# Class indices: 0=Car, 1=Bicycle, 2=Person, 3=Roadsign
+# ---------------------------------------------------------------------------
+_CLASS_COLORS = [
+    (0,   255, 0),    # green  -- Car
+    (255, 128, 0),    # orange -- Bicycle
+    (0,   128, 255),  # sky    -- Person
+    (255, 0,   255),  # magenta -- Roadsign
+]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -109,14 +132,20 @@ def setup_logging(level_str):
 
 
 # ---------------------------------------------------------------------------
-# Application state (shared across probe callbacks)
+# Application state (shared across probe callbacks and main thread)
 # ---------------------------------------------------------------------------
 
 class AppState:
-    def __init__(self, manager, cfg, headless):
+    def __init__(self, manager, cfg, headless, pgie_enabled=False, pgie_config_path=''):
         self.manager     = manager
         self.cfg         = cfg
         self.headless    = headless
+
+        # Phase 6: PGIE support
+        self.pgie_enabled = pgie_enabled
+        self.pgie_config_path = pgie_config_path
+        self.pgie_element = None # Reference to nvinfer element for optimization
+        self.first_frame_detections = [] # list of dicts: [x,y,w,h,class_id,label,conf]
 
         self.initialized = False
         self.init_frame  = None    # RGBA frame captured in probe
@@ -130,7 +159,113 @@ class AppState:
 
 
 # ---------------------------------------------------------------------------
-# Pad probe: tracker inference + NvDsObjectMeta attachment
+# Click-to-Select GUI (runs in main thread only -- Lesson 25)
+# ---------------------------------------------------------------------------
+
+def select_bbox_click_to_select(frame_rgba, detections):
+    """
+    Display the first frame with PGIE detection boxes drawn as coloured overlays.
+    The user LEFT-CLICKS on the target object; the smallest enclosing box is
+    returned as [x, y, w, h].
+
+    Returns [x, y, w, h] on selection, or None if the user presses Q / ESC
+    to fall back to manual selectROI.
+
+    MUST be called from the main thread (Lesson 25).
+    """
+    log = logging.getLogger('gui')
+
+    frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+
+    # Draw each detected box with a class-coloured rectangle + label
+    for det in detections:
+        x, y, w, h = det['x'], det['y'], det['w'], det['h']
+        class_id    = det['class_id']
+        label       = det['label'] or ('cls%d' % class_id)
+        conf        = det['confidence']
+        color       = _CLASS_COLORS[class_id % len(_CLASS_COLORS)]
+
+        cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
+        tag = '%s %.2f' % (label, conf)
+        cv2.putText(frame_bgr, tag,
+                    (x, max(y - 4, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+    # Instruction banner
+    cv2.putText(frame_bgr,
+                'CLICK object to track.  Q / ESC = manual ROI.',
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 255), 2, cv2.LINE_AA)
+
+    win_name = 'Click-to-Select Object'
+    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+    cv2.imshow(win_name, frame_bgr)
+
+    # Shared result dict -- updated by the mouse callback
+    result = {'selected': None, 'done': False}
+
+    def on_click(event, cx, cy, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        best      = None
+        best_area = float('inf')
+        for det in detections:
+            dx, dy, dw, dh = det['x'], det['y'], det['w'], det['h']
+            if dx <= cx <= dx + dw and dy <= cy <= dy + dh:
+                area = dw * dh
+                if area < best_area:
+                    best_area = area
+                    best = [dx, dy, dw, dh]
+        if best is not None:
+            param['selected'] = best
+            param['done']     = True
+            log.info('Click-to-select: box=%s', best)
+        else:
+            log.warning('Click at (%d, %d) did not land inside any detection.', cx, cy)
+
+    cv2.setMouseCallback(win_name, on_click, result)
+
+    # Poll until a valid click or the user cancels
+    while not result['done']:
+        key = cv2.waitKey(50) & 0xFF
+        if key == ord('q') or key == 27:   # Q or ESC
+            log.info('Click-to-select cancelled -- falling back to manual ROI.')
+            break
+
+    cv2.destroyWindow(win_name)
+    cv2.waitKey(1)   # flush the window close event
+
+    return result['selected']   # None if cancelled
+
+
+def manual_roi_select(frame_rgba):
+    """
+    Classic OpenCV selectROI on the captured frame.
+    Returns [x, y, w, h] or None if cancelled (0-sized selection).
+
+    MUST be called from the main thread (Lesson 25).
+    """
+    disp     = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
+    win_name = 'ROI Selection -- draw box then SPACE/ENTER'
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(win_name, 960, 720)
+    cv2.putText(disp, 'Draw ROI + SPACE/ENTER.  C = cancel.',
+                (20, 40), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1.2, (0, 200, 0), 2)
+    # Lesson 9: imshow before selectROI to fully initialise the Qt window
+    cv2.imshow(win_name, disp)
+    cv2.waitKey(1)
+
+    roi = cv2.selectROI(win_name, disp, fromCenter=False)
+    x, y, w, h = [int(v) for v in roi]
+    cv2.destroyWindow(win_name)
+    cv2.waitKey(1)
+
+    if w > 0 and h > 0:
+        return [x, y, w, h]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pad probe: read PGIE detections (frame 0) + tracker inference + metadata
 # ---------------------------------------------------------------------------
 
 def tracker_probe(pad, info, state):
@@ -141,9 +276,12 @@ def tracker_probe(pad, info, state):
       1. Extract batch metadata from the GstBuffer.
       2. Get frame pixels via pyds.get_nvds_buf_surface (returns RGBA NumPy array).
       3. Convert RGBA -> RGB for the SUTrack preprocessor.
-      4. On frame 0: initialize the tracker from static_roi / init_bbox.
-         On frame N: call tracker_manager.update() to get bounding boxes.
-      5. Attach NvDsObjectMeta for each tracked box so nvdsosd draws it in GPU.
+      4. Frame 0 (not yet initialized):
+           a. If PGIE enabled: read NvDsObjectMeta detections placed by nvinfer.
+           b. Capture frame + store detections in state.
+           c. Signal main thread (frame_ready); BLOCK until init_done.
+      5. Frame N (initialized): call tracker_manager.update(), attach result
+         NvDsObjectMeta so nvdsosd draws the tracked box in GPU memory.
     """
     if not PYDS_AVAILABLE:
         return Gst.PadProbeReturn.OK
@@ -183,10 +321,12 @@ def tracker_probe(pad, info, state):
         # RGBA -> RGB  (tracker trained on RGB; Lesson 12)
         frame_rgb = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2RGB)
 
+
         # --- Initialize tracker on first frame ---
         if not state.initialized:
             bbox = state.init_bbox
 
+            # Priority 1: static_roi or CLI --init_bbox
             if bbox is None:
                 static_roi = state.cfg.get('tracker', {}).get('static_roi', '')
                 if static_roi:
@@ -196,27 +336,77 @@ def tracker_probe(pad, info, state):
                         log.error('Invalid static_roi format: %s', e)
 
             if bbox is not None:
-                # Static ROI: initialize directly in probe (thread-safe)
+                # Headless static init -- no GUI required
                 x, y, w, h = [int(v) for v in bbox]
                 state.manager.initialize(frame_rgb, [x, y, w, h], frame_idx=0)
                 state.initialized = True
-                log.info('Tracker initialized with static bbox=[%d, %d, %d, %d]', x, y, w, h)
+                log.info('Tracker initialized with static bbox=[%d, %d, %d, %d]',
+                         x, y, w, h)
+                
+                # Phase 6.5: Optimize PGIE (one-shot mode)
+                if state.pgie_element:
+                    log.info('PGIE optimization: Setting interval to 10000 for power-save.')
+                    state.pgie_element.set_property('interval', 10000)
+
             elif not state.headless:
-                # GUI selection: catch frame, signal main, and WAIT for result
+                # GUI path: capture first frame once, then block until main thread
+                # completes ROI selection (Lesson 26 -- threading.Event sync).
                 if state.init_frame is None:
                     state.init_frame = frame_rgba.copy()
+
+                    # Priority 2: PGIE click-to-select
+                    # Read detections that nvinfer attached to this frame's metadata.
+                    if state.pgie_enabled:
+                        dets = []
+                        l_obj = frame_meta.obj_meta_list
+                        while l_obj is not None:
+                            try:
+                                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                            except StopIteration:
+                                break
+                            rect = obj_meta.rect_params
+                            dets.append({
+                                'x':          int(rect.left),
+                                'y':          int(rect.top),
+                                'w':          int(rect.width),
+                                'h':          int(rect.height),
+                                'class_id':   int(obj_meta.class_id),
+                                'label':      str(obj_meta.obj_label)
+                                              if obj_meta.obj_label else '',
+                                'confidence': float(obj_meta.confidence),
+                            })
+                            try:
+                                l_obj = l_obj.next
+                            except StopIteration:
+                                break
+                        state.first_frame_detections = dets
+                        log.info('PGIE detections on first frame: %d', len(dets))
+
                     state.frame_ready.set()
-                
+
                 log.debug('Probe thread blocking for ROI selection...')
-                # This blocks the GStreamer streaming thread until main thread sets init_done
-                state.init_done.wait() 
+                state.init_done.wait()
                 log.debug('Probe thread unblocked.')
-                
-                # After unblocking, the tracker should be initialized by main thread.
-                # If selection failed, main thread will have set init_done but not initialized.
+
                 if not state.initialized:
+                    # Selection was cancelled -- quit pipeline
                     state.loop.quit()
                     return Gst.PadProbeReturn.DROP
+                
+                # Phase 6.4: Clear detections for frame 0 too!
+                while frame_meta.obj_meta_list is not None:
+                    try:
+                        obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
+                        pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+                    except Exception:
+                        break
+                while frame_meta.display_meta_list is not None:
+                    try:
+                        disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
+                        pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
+                    except Exception:
+                        break
+
             else:
                 log.error('Headless mode requires static_roi or --init_bbox.')
                 state.loop.quit()
@@ -228,7 +418,25 @@ def tracker_probe(pad, info, state):
                 break
             continue
 
-        # --- Track ---
+        # --- Track (all frames after initialization) ---
+        if state.initialized:
+            # Phase 6.4: Clear PGIE artifacts (boxes, labels, display meta).
+            # Do this for EVERY frame after init (including frame 0 unblocking).
+            meta_list_to_clear = [frame_meta.obj_meta_list, frame_meta.display_meta_list]
+            while frame_meta.obj_meta_list is not None:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
+                    pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+                except Exception:
+                    break
+
+            while frame_meta.display_meta_list is not None:
+                try:
+                    disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
+                    pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
+                except Exception:
+                    break
+
         t0      = time.perf_counter()
         results = state.manager.update(frame_rgb, state.frame_idx)
         dt      = time.perf_counter() - t0
@@ -239,11 +447,11 @@ def tracker_probe(pad, info, state):
         fps = 1.0 / dt if dt > 0 else 0.0
 
         # --- Attach NvDsObjectMeta for each tracked box (nvdsosd draws them) ---
-        for obj_id, bbox in results.items():
-            x1, y1, bw, bh = [float(v) for v in bbox]
+        for obj_id, bbox_out in results.items():
+            x1, y1, bw, bh = [float(v) for v in bbox_out]
 
             obj_meta = pyds.nvds_acquire_obj_meta_from_pool(batch_meta)
-            obj_meta.unique_component_id = 1
+            obj_meta.unique_component_id = 2 # Distinct from PGIE
             obj_meta.object_id           = int(obj_id)
 
             # Bounding box visual properties
@@ -312,13 +520,16 @@ def on_decoder_pad_added(decoder, pad, next_element):
 
 def build_pipeline(state, pipe_cfg):
     """
-    Construct the Phase 5 GStreamer pipeline element-by-element.
+    Construct the Phase 6 GStreamer pipeline element-by-element.
 
-    Element chain:
-        source -> [decoder] -> nvvideoconvert(NVMM RGBA) -> mux
-        mux -> osd -> tee
-        tee -> queue -> nvvideoconvert -> [nv3dsink | nveglglessink | fakesink]
-        tee -> queue -> nvvideoconvert -> encoder -> rtp -> udpsink
+    Element chain (with PGIE):
+        source -> [decoder] -> nvconv1(NVMM RGBA) -> mux
+        mux -> pgie(nvinfer) -> nvconv_pgie -> osd -> tee
+        tee -> queue -> [conv_disp ->] [nv3dsink | nveglglessink | fakesink]
+        tee -> queue -> nvconv2 -> encoder -> rtp -> udpsink
+
+    Element chain (without PGIE, e.g. headless/static_roi):
+        source -> [decoder] -> nvconv1(NVMM RGBA) -> mux -> osd -> tee -> ...
 
     Pad probe is attached to the osd sink pad.
     """
@@ -333,7 +544,7 @@ def build_pipeline(state, pipe_cfg):
     if input_source.startswith('rtsp://') or input_source.startswith('http://'):
         src          = Gst.ElementFactory.make('uridecodebin', 'src')
         src.set_property('uri', input_source)
-        need_decoder = False          # uridecodebin handles decode internally
+        need_decoder = False
     elif input_source:
         src          = Gst.ElementFactory.make('filesrc', 'src')
         src.set_property('location', input_source)
@@ -346,8 +557,7 @@ def build_pipeline(state, pipe_cfg):
     decoder = Gst.ElementFactory.make('decodebin', 'decoder') if need_decoder else None
 
     # ------------------------------------------------ NV color convert (NVMM)
-    # compute-hw=1 uses the VIC engine and avoids EGL display requirement
-    # (Lessons 20, 21 -- headless safe)
+    # compute-hw=1 uses VIC engine -- no EGL display context required (Lesson 20)
     nvconv1 = Gst.ElementFactory.make('nvvideoconvert', 'nvconv1')
     nvconv1.set_property('compute-hw', 1)
     caps1   = Gst.ElementFactory.make('capsfilter', 'caps1')
@@ -362,45 +572,51 @@ def build_pipeline(state, pipe_cfg):
     mux.set_property('batched-push-timeout', 4000000)
     mux.set_property('live-source', 0)
 
+    # ------------------------------------ Optional: nvinfer PGIE (Phase 6)
+    # Added between mux and osd; runs the detector and attaches NvDsObjectMeta.
+    # A nvvideoconvert bridge follows to satisfy format requirements for nvdsosd.
+    pgie        = None
+    nvconv_pgie = None
+    if state.pgie_enabled and state.pgie_config_path:
+        pgie = Gst.ElementFactory.make('nvinfer', 'pgie')
+        if pgie is None:
+            logging.getLogger('pipeline').error(
+                'Failed to create nvinfer element -- PGIE disabled.')
+            state.pgie_enabled = False
+        else:
+            pgie.set_property('config-file-path', state.pgie_config_path)
+            state.pgie_element = pgie # Store reference for optimization
+            nvconv_pgie = Gst.ElementFactory.make('nvvideoconvert', 'nvconv_pgie')
+            nvconv_pgie.set_property('compute-hw', 1)
+
     # ------------------------------------------------------------ nvdsosd
     osd = Gst.ElementFactory.make('nvdsosd', 'osd')
-    osd.set_property('process-mode', 0)   # 0=CPU (safe); 1=GPU (faster if EGL)
+    osd.set_property('process-mode', 0)   # 0=CPU (safe without EGL; Lesson 23)
     osd.set_property('display-text', 1)
 
     # --------------------------------------------------------------- tee
     tee = Gst.ElementFactory.make('tee', 'tee')
 
     # -------------------------------------------- Branch A: local display
-    #
     # nvdsosd outputs NVMM surface arrays that nveglglessink cannot consume
-    # directly (error: gst_eglglessink_cuda_buffer_copy).
-    # Fix: always insert nvvideoconvert(compute-hw=1) before the display sink
-    # to convert the NVMM surface to a format the sink understands.
-    #
-    # Sink priority:
-    #   nv3dsink      -- Jetson native; handles NVMM directly, no EGL issues
-    #   nveglglessink -- EGL-based; needs nvvideoconvert bridge + DISPLAY set
-    #   fakesink      -- headless / RTSP-only mode
-    q_disp    = Gst.ElementFactory.make('queue',         'q_disp')
-    conv_disp = None   # populated for non-headless paths
+    # directly.  Fix: insert nvvideoconvert(compute-hw=1) as a bridge first.
+    # Prefer nv3dsink (Jetson-native NVMM) over nveglglessink (Lesson 24).
+    q_disp    = Gst.ElementFactory.make('queue',     'q_disp')
+    conv_disp = None
 
     if state.headless:
         sink_disp = Gst.ElementFactory.make('fakesink', 'sink_disp')
         sink_disp.set_property('sync', False)
     else:
-        # nvvideoconvert bridge: converts NVMM RGBA -> format the sink expects
         conv_disp = Gst.ElementFactory.make('nvvideoconvert', 'conv_disp')
         conv_disp.set_property('compute-hw', 1)
-
-        # Prefer nv3dsink (Jetson AGX / Orin) -- no EGL context needed
         sink_disp = Gst.ElementFactory.make('nv3dsink', 'sink_disp')
         if sink_disp is None:
-            # Fall back to nveglglessink (requires DISPLAY=:0)
             sink_disp = Gst.ElementFactory.make('nveglglessink', 'sink_disp')
         sink_disp.set_property('sync', False)
 
     # ---------------------------------------------- Branch B: RTSP stream
-    rtsp_enabled = (pipe_cfg.get('rtsp_enabled', True) and RTSP_AVAILABLE)
+    rtsp_enabled  = (pipe_cfg.get('rtsp_enabled', True) and RTSP_AVAILABLE)
     rtsp_elements = []
 
     if rtsp_enabled:
@@ -420,10 +636,10 @@ def build_pipeline(state, pipe_cfg):
 
     # ------------------------------------------------------- Add to pipeline
     core_elements = [src, nvconv1, caps1, mux, osd, tee, q_disp, sink_disp]
-    if decoder:
-        core_elements.append(decoder)
-    if conv_disp is not None:
-        core_elements.append(conv_disp)
+    if decoder      is not None: core_elements.append(decoder)
+    if pgie         is not None: core_elements.append(pgie)
+    if nvconv_pgie  is not None: core_elements.append(nvconv_pgie)
+    if conv_disp    is not None: core_elements.append(conv_disp)
 
     for el in core_elements + rtsp_elements:
         if el is None:
@@ -431,22 +647,26 @@ def build_pipeline(state, pipe_cfg):
         pipeline.add(el)
 
     # --------------------------------------------------- Link static chain
-    # source -> decoder (file/camera only)
     if decoder:
         src.link(decoder)
         decoder.connect('pad-added', on_decoder_pad_added, nvconv1)
     else:
         src.connect('pad-added', on_decoder_pad_added, nvconv1)
 
-    # nvconv1 -> caps1 -> mux.sink_0 (request pad)
+    # nvconv1 -> caps1 -> mux.sink_0
     nvconv1.link(caps1)
     caps1.get_static_pad('src').link(mux.get_request_pad('sink_0'))
 
-    # mux -> osd -> tee
-    mux.link(osd)
+    # mux -> [pgie -> nvconv_pgie ->] osd -> tee
+    if pgie is not None:
+        mux.link(pgie)
+        pgie.link(nvconv_pgie)
+        nvconv_pgie.link(osd)
+    else:
+        mux.link(osd)
     osd.link(tee)
 
-    # tee -> display branch (queue -> [conv_disp ->] sink_disp)
+    # tee -> display branch
     tee.get_request_pad('src_%u').link(q_disp.get_static_pad('sink'))
     if conv_disp is not None:
         q_disp.link(conv_disp)
@@ -476,10 +696,7 @@ def build_pipeline(state, pipe_cfg):
 def setup_rtsp_server(rtsp_port, udp_port, mount_path='/sutrack'):
     """
     Create a GstRtspServer that wraps the udpsink output as an RTSP stream.
-
-    Clients connect to:
-        rtsp://<jetson-ip>:<rtsp_port><mount_path>
-    e.g.: rtsp://192.168.1.100:8554/sutrack
+    Clients connect to: rtsp://<jetson-ip>:<rtsp_port><mount_path>
     """
     if not RTSP_AVAILABLE:
         return None
@@ -488,7 +705,6 @@ def setup_rtsp_server(rtsp_port, udp_port, mount_path='/sutrack'):
     server.props.service = str(rtsp_port)
 
     factory = GstRtspServer.RTSPMediaFactory.new()
-    # The factory re-reads RTP packets from the udpsink and serves them via RTSP
     factory.set_launch(
         '( udpsrc name=pay0 port=%d '
         'caps="application/x-rtp,media=video,clock-rate=90000,'
@@ -497,8 +713,7 @@ def setup_rtsp_server(rtsp_port, udp_port, mount_path='/sutrack'):
     factory.set_shared(True)
 
     server.get_mount_points().add_factory(mount_path, factory)
-    server.attach(None)   # attaches to the default GLib main context
-
+    server.attach(None)
     return server
 
 
@@ -526,7 +741,7 @@ def on_error(bus, msg, state):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='SUTrack DeepStream Phase 5 -- Native OSD + RTSP Streaming')
+        description='SUTrack DeepStream Phase 6 -- PGIE Click-to-Select ROI')
     parser.add_argument('--config', default='deepstream/configs/tracker_config.yml',
                         help='Path to tracker_config.yml')
     parser.add_argument('--input', '-i', default=None,
@@ -537,6 +752,12 @@ def main():
     parser.add_argument('--headless', action='store_true',
                         help='Disable local display (fakesink). '
                              'Requires static_roi or --init_bbox.')
+    parser.add_argument('--pgie-config', default=None,
+                        help='Path to pgie_config.txt. '
+                             'Overrides pgie_config in tracker_config.yml. '
+                             'Enables click-to-select ROI.')
+    parser.add_argument('--no-pgie', action='store_true',
+                        help='Disable PGIE even if pgie_config is set in config.')
     parser.add_argument('--no-rtsp', action='store_true',
                         help='Disable RTSP streaming (useful for debugging).')
     args = parser.parse_args()
@@ -565,6 +786,32 @@ def main():
     if args.no_rtsp:
         pipe_cfg['rtsp_enabled'] = False
 
+    headless = pipe_cfg.get('headless', False)
+
+    # ------------------------------------------------ Resolve PGIE config path
+    # Priority: --pgie-config CLI > pgie_config in tracker_config.yml
+    # Paths in config are relative to the deepstream/ directory (ROOT).
+    pgie_config_rel = pipe_cfg.get('pgie_config', '') or ''
+    if args.pgie_config:
+        pgie_config_rel = args.pgie_config
+
+    pgie_enabled = bool(pgie_config_rel) and not headless and not args.no_pgie
+
+    pgie_config_path = ''
+    if pgie_enabled:
+        if os.path.isabs(pgie_config_rel):
+            pgie_config_path = pgie_config_rel
+        else:
+            pgie_config_path = os.path.normpath(
+                os.path.join(ROOT, pgie_config_rel))
+        if not os.path.exists(pgie_config_path):
+            log.warning('pgie_config not found at %s -- PGIE disabled.',
+                        pgie_config_path)
+            pgie_enabled     = False
+            pgie_config_path = ''
+        else:
+            log.info('PGIE config: %s', pgie_config_path)
+
     # --------------------------------------------------------- Load TRT engine
     engine_path = os.path.normpath(
         os.path.join(ROOT, model_cfg.get('engine_path', '../sutrack_fp32.engine')))
@@ -588,9 +835,12 @@ def main():
         use_hanning         = model_cfg.get('use_hanning_window',    True),
     )
 
-    state          = AppState(manager=manager, cfg=cfg,
-                              headless=pipe_cfg.get('headless', False))
-    state.init_bbox = args.init_bbox  # may be None; probe will fall back to static_roi
+    state            = AppState(manager       = manager,
+                                cfg           = cfg,
+                                headless      = headless)
+    state.init_bbox  = args.init_bbox   # may be None
+    state.pgie_enabled = pgie_enabled
+    state.pgie_config_path = pgie_config_path
 
     # -------------------------------------------------------- Build GStreamer pipeline
     pipeline = build_pipeline(state, pipe_cfg)
@@ -620,50 +870,66 @@ def main():
     bus.connect('message::eos',   on_eos,   state)
     bus.connect('message::error', on_error, state)
 
-    log.info('Starting Phase 5 pipeline...')
+    log.info('Starting Phase 6 pipeline...')
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         log.error('Pipeline failed to reach PLAYING state.')
         sys.exit(1)
 
-    # --- Option A: Snapshot Hybrid (Main Thread GUI Selection) ---
-    if not state.initialized and not state.headless:
-        log.info('Waiting for first frame to open ROI selector...')
-        if state.frame_ready.wait(timeout=10.0) and state.init_frame is not None:
-            # We are in the MAIN THREAD here. Safe to use cv2 GUI.
-            disp = cv2.cvtColor(state.init_frame, cv2.COLOR_RGBA2BGR)
-            win_name = "ROI Selection (Snapshot)"
-            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-            cv2.resizeWindow(win_name, 960, 720)
-            cv2.putText(disp, 'Select ROI + SPACE / ENTER. C to cancel.', (20, 40),
-                       cv2.FONT_HERSHEY_COMPLEX_SMALL, 1.2, (0, 200, 0), 2)
-            cv2.imshow(win_name, disp)
-            cv2.waitKey(1)
-            
-            roi = cv2.selectROI(win_name, disp, fromCenter=False)
-            x, y, w, h = [int(v) for v in roi]
-            cv2.destroyWindow(win_name)
+    # -------------------------------- GUI ROI selection (main thread -- Lesson 25)
+    # Only when not already initialized via static_roi / --init_bbox.
+    if not state.initialized and not headless:
+        log.info('Waiting for first frame...')
+        if not state.frame_ready.wait(timeout=15.0) or state.init_frame is None:
+            log.error('Timeout waiting for first frame. Check input source.')
+            state.init_done.set()
+            pipeline.set_state(Gst.State.NULL)
+            sys.exit(1)
 
-            if w > 0 and h > 0:
-                # Manager needs RGB
-                frame_rgb = cv2.cvtColor(state.init_frame, cv2.COLOR_RGBA2RGB)
-                state.manager.initialize(frame_rgb, [x, y, w, h], frame_idx=0)
-                state.initialized = True
-                log.info('Tracker initialized via GUI: bbox=[%d, %d, %d, %d]', x, y, w, h)
-                
-                # Signal the PROBE thread to continue
-                state.init_done.set()
+        selected_bbox = None
+
+        # --- Mode A: PGIE click-to-select ---
+        if state.pgie_enabled:
+            if state.first_frame_detections:
+                log.info('Showing %d PGIE detections for click-to-select...',
+                         len(state.first_frame_detections))
+                selected_bbox = select_bbox_click_to_select(
+                    state.init_frame, state.first_frame_detections)
+                if selected_bbox is not None:
+                    log.info('Click-to-select result: %s', selected_bbox)
+                else:
+                    log.info('No click selection -- falling back to manual ROI.')
             else:
-                log.error('ROI selection cancelled or invalid. Quitting.')
-                state.init_done.set() # Unblock probe so it can quit
-                pipeline.set_state(Gst.State.NULL)
-                sys.exit(0)
-        else:
-            if not state.initialized:
-                log.error('Timeout or error capturing first frame for ROI selection.')
-                state.init_done.set()
-                pipeline.set_state(Gst.State.NULL)
-                sys.exit(1)
+                log.warning('PGIE found no detections on first frame. '
+                            'Falling back to manual ROI.')
+
+        # --- Mode B: Manual selectROI (fallback) ---
+        if selected_bbox is None:
+            log.info('Manual ROI selection...')
+            selected_bbox = manual_roi_select(state.init_frame)
+
+        if selected_bbox is None:
+            log.error('ROI selection cancelled. Quitting.')
+            state.init_done.set()
+            pipeline.set_state(Gst.State.NULL)
+            sys.exit(0)
+
+        # Initialize tracker from the selected box (main thread -- safe)
+        x, y, w, h = selected_bbox
+        frame_rgb   = cv2.cvtColor(state.init_frame, cv2.COLOR_RGBA2RGB)
+        state.manager.initialize(frame_rgb, [int(x), int(y), int(w), int(h)],
+                                 frame_idx=0)
+        state.initialized = True
+        log.info('Tracker initialized: bbox=[%d, %d, %d, %d]',
+                 int(x), int(y), int(w), int(h))
+
+        # Phase 6.5: Optimize PGIE (one-shot mode)
+        if state.pgie_element:
+            log.info('PGIE optimization: Setting interval to 10000 for power-save.')
+            state.pgie_element.set_property('interval', 10000)
+
+        # Unblock the probe thread (Lesson 26)
+        state.init_done.set()
 
     try:
         loop.run()
@@ -672,7 +938,8 @@ def main():
     finally:
         pipeline.set_state(Gst.State.NULL)
         if state.frame_count > 0:
-            avg = state.frame_count / state.total_time if state.total_time > 0 else 0.0
+            avg = (state.frame_count / state.total_time
+                   if state.total_time > 0 else 0.0)
             log.info('Done -- frames=%d  avg_fps=%.2f', state.frame_count, avg)
 
 

@@ -1,6 +1,66 @@
 # DeepStream SUTrack - Architecture
 
-## Pipeline (Phase 5 - Native OSD + RTSP Streaming)
+## Pipeline (Phase 6 - PGIE + Click-to-Select ROI, Current)
+
+```
+Video / Camera
+      |
+      V
+  filesrc / v4l2src
+      |
+  decodebin  (HW decode; dynamic pad -> on_decoder_pad_added)
+      |
+  nvvideoconvert (compute-hw=1, VIC) -> video/x-raw(memory:NVMM),format=RGBA
+      |
+  nvstreammux (width x height, batch-size=1)
+      |
+  nvinfer (PGIE) [optional -- only when pgie_config is set in tracker_config.yml]
+      |              ResNet-10 INT8 detector; populates NvDsObjectMeta per object
+      |
+  nvvideoconvert (compute-hw=1)  [bridge required between nvinfer and nvdsosd]
+      |
+      V
+  [PAD PROBE on nvdsosd sink pad]
+      |
+      |  pyds.get_nvds_buf_surface() -> RGBA NumPy (CPU copy)
+      |  On frame 0: capture frame + read obj_meta_list detections
+      |              state.frame_ready.set()        (signal main thread)
+      |              state.init_done.wait()          (block until ROI selected)
+      |  Frame 1+:  cv.cvtColor RGBA->RGB
+      |              TrackerManager.update()
+      |              For each bbox: pyds.nvds_acquire_obj_meta_from_pool()
+      |                             populate rect_params + text_params
+      |                             pyds.nvds_add_obj_meta_to_frame()
+      |
+  nvdsosd (process-mode=0, CPU)  <- draws NvDsObjectMeta boxes in GPU memory
+      |
+      +------- tee --------+
+      |                    |
+   Branch A             Branch B
+  (Display)             (RTSP)
+      |                    |
+  queue               queue
+      |                    |
+  nvvideoconvert      nvvideoconvert (compute-hw=1)
+  (compute-hw=1)           |
+      |               nvv4l2h264enc (HW H.264 NVENC)
+  nv3dsink /               |
+  nveglglessink        rtph264pay
+                           |
+                       udpsink (port 5400)
+
+  GstRtspServer (port 8554):
+      udpsrc(5400) -> rtsp://<jetson-ip>:8554/sutrack
+
+  Main thread (ROI selection, runs while probe is blocked):
+      state.frame_ready.wait()     <- waits for probe to capture first frame
+      select_bbox_click_to_select()  <- OpenCV window, PGIE boxes drawn, user clicks
+          OR manual_roi_select()     <- fallback: draw box with mouse
+      manager.initialize(frame_rgb, bbox)
+      state.init_done.set()        <- unblocks probe thread
+```
+
+## Pipeline (Phase 5 - Native OSD + RTSP Streaming, without PGIE)
 
 ```
 Video / Camera
@@ -127,6 +187,26 @@ locale settings (Lesson 19).
 ### Engine Location
 The compiled engine (`sutrack_fp32.engine`) lives at the SUTrack repo root.
 `tracker_config.yml` references it as `../sutrack_fp32.engine` (relative to `deepstream/`).
+
+### Phase 6 — PGIE Click-to-Select ROI
+An `nvinfer` element runs a DeepStream ResNet-10 INT8 detector on the first frame.
+The probe captures the frame and all `NvDsObjectMeta` detections, then signals the
+main thread via `threading.Event` (Lesson 26). The main thread opens an OpenCV window
+with per-class coloured boxes drawn and waits for a mouse click. When the user clicks
+on a detection, the smallest enclosing bounding box is selected and passed to
+`TrackerManager.initialize()`. The probe is unblocked and tracking begins from frame 1.
+
+Fallback chain (three tiers):
+1. `static_roi` in config (or `--init_bbox` CLI) — headless, no window
+2. PGIE detections present — `select_bbox_click_to_select()` click window
+3. PGIE disabled or no detections — `manual_roi_select()` (draw box with mouse)
+
+`nvinfer` is wired between `nvstreammux` and the `nvvideoconvert` bridge before `nvdsosd`.
+A second `nvvideoconvert(compute-hw=1)` is required after `nvinfer` and before `nvdsosd`
+following DeepStream sample pipeline best practices.
+
+Thread safety: all OpenCV GUI calls (`namedWindow`, `imshow`, `setMouseCallback`) are
+confined to the Python main thread, never called inside the GStreamer pad probe (Lesson 25).
 
 ### Phase 5 — Native OSD + RTSP (Zero-Copy Drawing)
 BBox drawing is moved from OpenCV CPU to DeepStream `nvdsosd` (GPU memory).
