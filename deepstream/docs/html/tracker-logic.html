@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tracker Logic — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">&#127968;</span> Overview</a>
+    <a href="pipeline.html"><span class="nav-icon">&#127909;</span> GStreamer Pipeline</a>
+    <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
+    <a href="tracker-logic.html" class="active"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+  </nav>
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#overview"><span class="nav-icon">&#128200;</span> How SUTrack Works</a>
+    <a href="#preprocess"><span class="nav-icon">&#128247;</span> Image Preprocessing</a>
+    <a href="#crop"><span class="nav-icon">&#9986;</span> Crop Extraction</a>
+    <a href="#anno"><span class="nav-icon">&#128204;</span> Template Annotation</a>
+    <a href="#hanning"><span class="nav-icon">&#127769;</span> Hanning Window</a>
+    <a href="#instance"><span class="nav-icon">&#127919;</span> TrackerInstance</a>
+    <a href="#postprocess"><span class="nav-icon">&#128203;</span> Post-Processing</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#127919; tracker/tracker_utils.py &amp; tracker_instance.py</div>
+    <h1>Tracker Logic</h1>
+    <p>The core algorithm that makes tracking work: how frames are preprocessed, how the model outputs are decoded into bounding boxes, and the critical rules that keep predictions stable.</p>
+  </div>
+
+  <h2 id="overview">How SUTrack Works — The Big Picture</h2>
+  <p>
+    SUTrack is a <strong>Siamese-style tracker</strong>. It takes two images on every frame:
+  </p>
+  <ul>
+    <li><strong>Template</strong> — a small crop of the target from the initialization frame. This never changes.</li>
+    <li><strong>Search region</strong> — a larger crop centered on the target's last known position. This updates every frame.</li>
+  </ul>
+  <p>
+    The model compares the template to every location in the search region and outputs a
+    <strong>score map</strong> — a 14×14 grid of confidence values. The peak of that grid
+    is where the target is most likely to be.
+  </p>
+
+  <div class="diagram"><span class="d-title">SUTRACK FORWARD PASS</span>
+
+  Template crop (112x112)    Search crop (224x224)
+         |                         |
+         v                         v
+  preprocess()              preprocess()
+  (1, 6, 112, 112)          (1, 6, 224, 224)
+         |                         |
+         +----------+--------------+
+                    |
+              TRT engine
+                    |
+         +----------+--------------+
+         |          |              |
+         v          v              v
+    score_map    size_map     offset_map
+    (14x14)      (2x196)      (2x196)
+         |
+   hanning *    spatial suppression (before argmax!)
+         |
+      argmax --> peak location (idx_x, idx_y)
+         |
+   decode cx, cy, w, h
+         |
+   map crop coords --> image coords
+         |
+   position-only clamp
+         |
+   updated [x, y, w, h]</div>
+
+  <h2 id="preprocess">Image Preprocessing — <code>preprocess()</code></h2>
+  <p>
+    Both the template crop and the search crop are preprocessed the same way before being
+    fed to the TRT engine.
+  </p>
+
+  <pre><code><span class="cm"># ImageNet mean and standard deviation (used during training)</span>
+_MEAN = np.<span class="fn">array</span>([<span class="nu">0.485</span>, <span class="nu">0.456</span>, <span class="nu">0.406</span>], dtype=np.float32)
+_STD  = np.<span class="fn">array</span>([<span class="nu">0.229</span>, <span class="nu">0.224</span>, <span class="nu">0.225</span>], dtype=np.float32)
+
+<span class="kw">def</span> <span class="fn">preprocess</span>(img_rgb: np.ndarray) -> np.ndarray:
+    img  = img_rgb.<span class="fn">astype</span>(np.float32) / <span class="nu">255.0</span>   <span class="cm"># [0,255] -> [0,1]</span>
+    img  = (img - _MEAN) / _STD                    <span class="cm"># normalize per channel</span>
+    img  = img.<span class="fn">transpose</span>(<span class="nu">2</span>, <span class="nu">0</span>, <span class="nu">1</span>)                <span class="cm"># HWC -> CHW  (3, H, W)</span>
+    img6 = np.<span class="fn">concatenate</span>([img, img], axis=<span class="nu">0</span>)    <span class="cm"># CHW -> (6, H, W)</span>
+    <span class="kw">return</span> np.<span class="fn">ascontiguousarray</span>(img6[np.newaxis], dtype=np.float32)
+    <span class="cm">#  shape: (1, 6, H, W)</span></code></pre>
+
+  <p>Three things happen here:</p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Normalize to [0, 1] then standardize</h4>
+        <p>The model was trained with ImageNet normalization. Pixel values divided by 255 first, then shifted by the per-channel mean and divided by the standard deviation. This matches what the model saw during training.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Transpose HWC to CHW</h4>
+        <p>NumPy images are <code>(H, W, 3)</code>. Neural networks (and TensorRT) expect channels first: <code>(3, H, W)</code>.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Channel duplication: 3 channels to 6</h4>
+        <p>
+          SUTrack was designed for multi-modal input (e.g., RGB + Depth, or RGB + Thermal).
+          Each modality uses 3 channels. For pure RGB tracking, we simply duplicate the
+          3 RGB channels to produce a 6-channel input. This keeps the model architecture
+          unchanged while using only a single camera.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 5 — RGB Input Only</div>
+    The model was trained on RGB images. Always convert BGR (from OpenCV/GStreamer) to RGB
+    with <code>cv.cvtColor(frame, cv.COLOR_BGR2RGB)</code> before calling <code>preprocess()</code>.
+    A BGR input shifts every pixel's colors — the tracker silently produces wrong predictions.
+  </div>
+
+  <h2 id="crop">Crop Extraction — <code>sample_target()</code></h2>
+  <p>
+    Rather than processing the full frame, SUTrack only looks at a <strong>square crop</strong>
+    centered on the target. This is more efficient and forces the model to focus on the
+    relevant region.
+  </p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">sample_target</span>(im, target_bb, search_area_factor, output_sz):
+    x, y, w, h = target_bb
+    crop_sz = math.<span class="fn">ceil</span>(math.<span class="fn">sqrt</span>(w * h) * search_area_factor)
+
+    cx = x + <span class="nu">0.5</span> * w   <span class="cm"># center of target</span>
+    cy = y + <span class="nu">0.5</span> * h
+
+    x1 = <span class="fn">round</span>(cx - crop_sz * <span class="nu">0.5</span>)   <span class="cm"># crop top-left</span>
+    y1 = <span class="fn">round</span>(cy - crop_sz * <span class="nu">0.5</span>)
+
+    <span class="cm"># Pad if the crop extends outside the image boundaries</span>
+    crop = im[<span class="fn">max</span>(y1,<span class="nu">0</span>):y1+crop_sz, <span class="fn">max</span>(x1,<span class="nu">0</span>):x1+crop_sz]
+    crop = cv.<span class="fn">copyMakeBorder</span>(crop, y1_pad, y2_pad, x1_pad, x2_pad,
+                              cv.BORDER_CONSTANT)
+    crop = cv.<span class="fn">resize</span>(crop, (output_sz, output_sz))
+
+    resize_factor = output_sz / crop_sz
+    <span class="kw">return</span> crop, resize_factor</code></pre>
+
+  <p>The crop size is determined by the target's size and a <em>search area factor</em>:</p>
+  <table>
+    <thead><tr><th>Use</th><th>Factor</th><th>Crop size formula</th><th>Output size</th></tr></thead>
+    <tbody>
+      <tr><td>Template (init)</td><td>2.0</td><td><code>sqrt(w*h) * 2.0</code></td><td>112 x 112 px</td></tr>
+      <tr><td>Search region (each frame)</td><td>4.0</td><td><code>sqrt(w*h) * 4.0</code></td><td>224 x 224 px</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The <strong>resize factor</strong> returned is critical: it maps predicted coordinates
+    from the 224-pixel crop space back to the original image space later in post-processing.
+  </p>
+
+  <div class="callout info">
+    <div class="callout-title">Border Padding</div>
+    If the crop extends beyond the image edges (object near a border), the missing area is
+    filled with black pixels using <code>cv.copyMakeBorder</code>. This prevents the crop from
+    being smaller than expected, which would break the coordinate mapping.
+  </div>
+
+  <h2 id="anno">Template Annotation — <code>transform_image_to_crop()</code></h2>
+  <p>
+    When initializing, we also need to tell the model <em>exactly where the target is
+    inside the template crop</em>. This is the <code>template_anno</code> input —
+    a normalized [x1, y1, w, h] box in the 112x112 crop coordinate space.
+  </p>
+  <pre><code><span class="kw">def</span> <span class="fn">transform_image_to_crop</span>(box_in, box_extract, resize_factor, crop_sz):
+    <span class="cm"># Find center of target relative to crop center</span>
+    out_cx = (crop_sz - <span class="nu">1</span>) / <span class="nu">2.0</span> + (cx_in - cx_ex) * resize_factor
+    out_cy = (crop_sz - <span class="nu">1</span>) / <span class="nu">2.0</span> + (cy_in - cy_ex) * resize_factor
+    out_w  = w_in * resize_factor
+    out_h  = h_in * resize_factor
+
+    <span class="cm"># Normalize to [0, 1] range</span>
+    norm = float(crop_sz - <span class="nu">1</span>)
+    <span class="kw">return</span> np.<span class="fn">array</span>([out_x1/norm, out_y1/norm, out_w/norm, out_h/norm])</code></pre>
+
+  <h2 id="hanning">The Hanning Window</h2>
+  <p>
+    The raw score map from the model can have secondary peaks — locations that look slightly
+    like the target but are actually distractors (similar-looking objects in the background).
+  </p>
+  <p>
+    The <strong>Hanning (cosine) window</strong> is a 2D weight mask that is highest at the
+    center and smoothly tapers to zero at the edges. Multiplying the score map by this window
+    <em>penalizes</em> predictions far from the center of the search crop, suppressing
+    edge distractors while preserving the true target peak.
+  </p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">hann1d</span>(sz: int) -> np.ndarray:
+    n = np.<span class="fn">arange</span>(<span class="nu">1</span>, sz + <span class="nu">1</span>, dtype=np.float32)
+    <span class="kw">return</span> <span class="nu">0.5</span> * (<span class="nu">1.0</span> - np.<span class="fn">cos</span>(<span class="nu">2.0</span> * math.pi * n / (sz + <span class="nu">1</span>)))
+
+<span class="kw">def</span> <span class="fn">hann2d</span>(h: int, w: int) -> np.ndarray:
+    <span class="cm"># Outer product of two 1D windows => 2D separable window</span>
+    <span class="kw">return</span> <span class="fn">hann1d</span>(h)[:, np.newaxis] * <span class="fn">hann1d</span>(w)[np.newaxis, :]</code></pre>
+
+  <p>
+    For the sutrack_t224 model the feature map is 14x14, so the window is a 14x14 array
+    where the center cell has weight ≈1.0 and the corners have weight ≈0.0.
+  </p>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 4 — Hanning Window Before argmax</div>
+    Multiply <code>score_map * hann_window</code> <strong>before</strong> finding the peak with
+    <code>np.argmax()</code>. If you apply the window after argmax, it has no effect on which
+    peak was selected — the suppression is completely bypassed.
+  </div>
+
+  <h2 id="instance">TrackerInstance — Per-Object State</h2>
+  <p>
+    Each tracked object has its own <code>TrackerInstance</code>. It stores the template
+    that was captured at initialization time and the current bounding box state.
+  </p>
+
+  <pre><code><span class="kw">class</span> <span class="nb">TrackerInstance</span>:
+    object_id:       int           <span class="cm"># unique integer ID</span>
+    state:           list          <span class="cm"># [x, y, w, h] in image pixels</span>
+    _template_img:   np.ndarray    <span class="cm"># (1, 6, 112, 112) float32 — frozen at init</span>
+    _template_anno:  np.ndarray    <span class="cm"># (1, 4) float32 — normalized bbox in template</span>
+    last_seen_frame: int           <span class="cm"># frame index of last successful update</span>
+    confidence:      float         <span class="cm"># score_map peak value at last frame</span>
+    hann_window:     np.ndarray    <span class="cm"># (14, 14) precomputed weight mask</span></code></pre>
+
+  <h3><code>initialize(frame_rgb, bbox, frame_idx)</code></h3>
+  <p>
+    Called once when the user picks a target. Extracts the template crop, preprocesses it,
+    and computes the template annotation. These are stored and reused for every subsequent frame.
+  </p>
+  <pre><code><span class="kw">def</span> <span class="fn">initialize</span>(self, frame_rgb, bbox, frame_idx=<span class="nu">0</span>):
+    self.state = list(bbox)
+
+    <span class="cm"># Extract and preprocess template crop</span>
+    z_crop, rf = <span class="fn">sample_target</span>(frame_rgb, self.state,
+                               self.template_factor, self.template_size)
+    self._template_img = <span class="fn">preprocess</span>(z_crop)   <span class="cm"># (1, 6, 112, 112)</span>
+
+    <span class="cm"># Compute normalized annotation: where is the target inside the template?</span>
+    anno = <span class="fn">transform_image_to_crop</span>(self.state, self.state, rf, self.template_size)
+    self._template_anno = anno[np.newaxis].<span class="fn">astype</span>(np.float32)  <span class="cm"># (1, 4)</span></code></pre>
+
+  <h2 id="postprocess">Post-Processing — <code>track()</code></h2>
+  <p>
+    This is where model outputs become a real bounding box. The method runs every frame.
+    It is the most complex part of the tracking pipeline, so let's go step by step.
+  </p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">track</span>(self, frame_rgb, engine, frame_idx=<span class="nu">0</span>):
+    <span class="cm"># 1. Extract search crop centered on last known position</span>
+    x_crop, resize_factor = <span class="fn">sample_target</span>(
+        frame_rgb, self.state, self.search_factor, self.search_size)
+    search_np = <span class="fn">preprocess</span>(x_crop)   <span class="cm"># (1, 6, 224, 224)</span>
+
+    <span class="cm"># 2. TRT inference</span>
+    trt_out = engine.<span class="fn">infer</span>(self._template_img, search_np, self._template_anno)
+
+    <span class="cm"># 3. Extract maps (already sigmoid-activated — do NOT sigmoid again)</span>
+    score_map  = trt_out[<span class="st">'score_map'</span>].<span class="fn">reshape</span>(self.feat_sz, self.feat_sz)
+    size_map   = trt_out[<span class="st">'size_map'</span>].<span class="fn">reshape</span>(<span class="nu">2</span>, self.feat_sz * self.feat_sz)
+    offset_map = trt_out[<span class="st">'offset_map'</span>].<span class="fn">reshape</span>(<span class="nu">2</span>, self.feat_sz * self.feat_sz)
+
+    <span class="cm"># 4. Apply Hanning window BEFORE argmax</span>
+    <span class="kw">if</span> self.hann_window <span class="kw">is not None</span>:
+        score_map = score_map * self.hann_window
+
+    <span class="cm"># 5. Find peak location in the 14x14 grid</span>
+    idx   = <span class="fn">int</span>(np.<span class="fn">argmax</span>(score_map.<span class="fn">reshape</span>(-<span class="nu">1</span>)))
+    idx_y = idx // self.feat_sz
+    idx_x = idx % self.feat_sz
+
+    <span class="cm"># 6. Decode width, height, and sub-pixel offset at the peak</span>
+    w_norm = <span class="fn">float</span>(size_map[<span class="nu">0</span>, idx])
+    h_norm = <span class="fn">float</span>(size_map[<span class="nu">1</span>, idx])
+    off_x  = <span class="fn">float</span>(offset_map[<span class="nu">0</span>, idx])
+    off_y  = <span class="fn">float</span>(offset_map[<span class="nu">1</span>, idx])
+
+    <span class="cm"># 7. Compute normalized center: grid position + sub-pixel offset</span>
+    cx_norm = (idx_x + off_x) / self.feat_sz
+    cy_norm = (idx_y + off_y) / self.feat_sz
+
+    <span class="cm"># 8. Scale from normalized [0,1] -> crop-space pixels</span>
+    scale = self.search_size / resize_factor
+    cx = cx_norm * scale
+    cy = cy_norm * scale
+    w  = w_norm  * scale
+    h  = h_norm  * scale
+
+    <span class="cm"># 9. Map crop-space -> original image coordinates</span>
+    cx_prev = self.state[<span class="nu">0</span>] + <span class="nu">0.5</span> * self.state[<span class="nu">2</span>]
+    cy_prev = self.state[<span class="nu">1</span>] + <span class="nu">0.5</span> * self.state[<span class="nu">3</span>]
+    cx_real = cx + (cx_prev - <span class="nu">0.5</span> * scale)
+    cy_real = cy + (cy_prev - <span class="nu">0.5</span> * scale)
+
+    <span class="cm"># 10. Position-only clamp: keep predicted w, h as-is</span>
+    x1 = <span class="fn">max</span>(<span class="nu">0.0</span>, <span class="fn">min</span>(cx_real - <span class="nu">0.5</span> * w, W - <span class="nu">1.0</span>))
+    y1 = <span class="fn">max</span>(<span class="nu">0.0</span>, <span class="fn">min</span>(cy_real - <span class="nu">0.5</span> * h, H - <span class="nu">1.0</span>))
+
+    self.state = [x1, y1, w, h]
+    <span class="kw">return</span> self.state</code></pre>
+
+  <h3>Steps 6–9: Coordinate Decoding Explained</h3>
+  <p>
+    The model outputs everything in <em>normalized</em> coordinates relative to the feature map.
+    Here is how we convert them to real pixel coordinates:
+  </p>
+
+  <div class="diagram"><span class="d-title">COORDINATE MAPPING</span>
+
+  14x14 feature grid (normalized [0,1])
+         |
+         |  peak at grid cell (idx_x=7, idx_y=5) with offsets (0.3, -0.1)
+         |
+         v
+  cx_norm = (7 + 0.3) / 14  = 0.521
+  cy_norm = (5 - 0.1) / 14  = 0.350
+
+  scale = search_size / resize_factor
+        = 224 / (224 / crop_sz)
+        = crop_sz                    (crop size in original image pixels)
+
+  cx_crop = cx_norm * scale          (center in crop-space pixels)
+  cy_crop = cy_norm * scale
+
+  cx_image = cx_crop + (cx_prev - 0.5 * scale)
+           = cx_crop + (center_of_prev_bbox - half_of_crop_size)
+             ^-- shift from crop-local to image-global coordinates</div>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 3 — Position-Only Clamp</div>
+    When the predicted box extends past the image boundary, clamp only the <strong>top-left
+    corner</strong> (x1, y1). Never re-derive w and h from clamped corners.
+    <br><br>
+    <strong>Wrong approach:</strong> clamp x2 = min(x1+w, W), then set w = x2 - x1.
+    This causes the box to shrink to a thin line whenever the target is near the image edge.
+    <br><br>
+    <strong>Correct approach:</strong> <code>x1 = clamp(cx - w/2)</code>, keep w unchanged.
+    The box may partially extend off-screen — that is fine and expected.
+  </div>
+
+  <div class="page-footer">
+    <div class="nav-links"><a href="engine.html">&#8592; TensorRT Engine</a></div>
+    <div class="nav-links"><a href="multi-object.html">Next: Multi-Object Manager &#8594;</a></div>
+  </div>
+
+</main>
+</body>
+</html>

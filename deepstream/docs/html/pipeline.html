@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GStreamer Pipeline — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">&#127968;</span> Overview</a>
+    <a href="pipeline.html" class="active"><span class="nav-icon">&#127909;</span> GStreamer Pipeline</a>
+    <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+  </nav>
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#gstreamer"><span class="nav-icon">&#10067;</span> What is GStreamer?</a>
+    <a href="#build-pipeline"><span class="nav-icon">&#128295;</span> Building the Pipeline</a>
+    <a href="#buffer-convert"><span class="nav-icon">&#128260;</span> Buffer Conversion</a>
+    <a href="#app-state"><span class="nav-icon">&#128190;</span> AppState</a>
+    <a href="#callback"><span class="nav-icon">&#128225;</span> Appsink Callback</a>
+    <a href="#main"><span class="nav-icon">&#9654;</span> Main Function</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#127909; apps/deepstream_tracker_app.py</div>
+    <h1>GStreamer Pipeline</h1>
+    <p>How video flows from a file or camera through DeepStream into Python, how each frame becomes a NumPy array, and how tracking results get drawn and saved.</p>
+  </div>
+
+  <h2 id="gstreamer">What is GStreamer?</h2>
+  <p>
+    GStreamer is a media framework that chains together <strong>elements</strong> like LEGO bricks
+    to form a <strong>pipeline</strong>. Each element does one job: reading a file, decoding video,
+    converting colors, or handing frames to Python.
+  </p>
+  <p>
+    On Jetson, NVIDIA provides special elements prefixed with <code>nv</code> that use the
+    hardware video decoder and GPU for color conversion — far faster than doing it in software.
+  </p>
+
+  <div class="callout info">
+    <div class="callout-title">Why DeepStream?</div>
+    DeepStream is NVIDIA's SDK built on GStreamer. It gives hardware-accelerated decode
+    (<code>nvv4l2decoder</code>) and color conversion (<code>nvvideoconvert</code>) for free,
+    leaving the CPU entirely available for the tracking logic.
+  </div>
+
+  <h2 id="build-pipeline">Building the Pipeline</h2>
+  <p>
+    The entire pipeline is written as a <strong>single string</strong> and parsed by
+    <code>Gst.parse_launch()</code>. Elements are connected with <code>!</code> — just like Unix pipes.
+  </p>
+
+  <div class="diagram"><span class="d-title">PIPELINE STRING (file input)</span>
+
+  filesrc location=/path/to/video.mp4
+      ! decodebin                     <span class="d-note"># auto-selects nvv4l2decoder on Jetson (HW decode)</span>
+      ! nvvideoconvert compute-hw=0   <span class="d-note"># GPU: NVMM memory -> system RAM, output RGBA</span>
+      ! video/x-raw,format=RGBA       <span class="d-note"># capability filter: force RGBA</span>
+      ! videoconvert                   <span class="d-note"># CPU: final format normalization</span>
+      ! video/x-raw,format=RGBA
+      ! appsink name=appsink           <span class="d-note"># hand buffer to Python callback</span>
+            emit-signals=true          <span class="d-note"># fire on_new_sample() each frame</span>
+            max-buffers=1              <span class="d-note"># keep only the latest frame</span>
+            drop=true                  <span class="d-note"># drop old frames if tracker is slow</span>
+            sync=false                 <span class="d-note"># process as fast as possible</span></div>
+
+  <h3>Source Selection</h3>
+  <table>
+    <thead><tr><th>Input value</th><th>GStreamer source</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>Empty / omitted</td><td><code>v4l2src device=/dev/video0</code></td><td>USB or CSI camera</td></tr>
+      <tr><td>File path</td><td><code>filesrc location=... ! decodebin</code></td><td>Recorded video files</td></tr>
+      <tr><td><code>rtsp://...</code></td><td><code>uridecodebin uri=... ! queue</code></td><td>IP cameras, network streams</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Why Two Color Converters?</h3>
+  <p>
+    The Jetson hardware decoder outputs frames in <strong>NVMM memory</strong> — GPU memory
+    the CPU cannot read directly. Two elements are needed to bridge this:
+  </p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4><code>nvvideoconvert</code> — NVMM to System RAM</h4>
+        <p>NVIDIA element that moves the frame from GPU memory to CPU-accessible RAM and converts
+        to RGBA. <code>compute-hw=0</code> uses the GPU path, which requires an EGL context
+        (<code>DISPLAY=:0</code>). Use <code>compute-hw=1</code> (VIC) for SSH headless sessions
+        where no display is connected.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4><code>videoconvert</code> — Format normalization</h4>
+        <p>Standard CPU-based GStreamer converter. Ensures the frame at <code>appsink</code>
+        is always RGBA regardless of what the upstream source produces.</p>
+      </div>
+    </div>
+  </div>
+
+  <h3>Appsink Options</h3>
+  <table>
+    <thead><tr><th>Option</th><th>Value</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>emit-signals</code></td><td>true</td><td>Fires <code>on_new_sample()</code> for each frame</td></tr>
+      <tr><td><code>max-buffers</code></td><td>1</td><td>At most 1 frame queued — prevents memory buildup</td></tr>
+      <tr><td><code>drop</code></td><td>true</td><td>Drops old frames if the tracker hasn't finished yet — keeps real-time</td></tr>
+      <tr><td><code>sync</code></td><td>false</td><td>Ignores presentation timestamps — process as fast as possible</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="buffer-convert">Buffer Conversion — <code>nvbuf_to_bgr()</code></h2>
+  <p>
+    Each GStreamer frame arrives as a raw <code>GstBuffer</code>. This function maps it
+    into a NumPy array and converts to BGR (OpenCV's native format).
+  </p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">nvbuf_to_bgr</span>(sample) -> np.ndarray:
+    buf       = sample.<span class="fn">get_buffer</span>()
+    structure = sample.<span class="fn">get_caps</span>().<span class="fn">get_structure</span>(<span class="nu">0</span>)
+
+    width  = structure.<span class="fn">get_int</span>(<span class="st">'width'</span>)[<span class="nu">1</span>]
+    height = structure.<span class="fn">get_int</span>(<span class="st">'height'</span>)[<span class="nu">1</span>]
+    fmt    = structure.<span class="fn">get_string</span>(<span class="st">'format'</span>)   <span class="cm"># e.g. "RGBA"</span>
+
+    result, mapinfo = buf.<span class="fn">map</span>(Gst.MapFlags.READ)
+    data = np.<span class="fn">frombuffer</span>(mapinfo.data, dtype=np.uint8)
+    buf.<span class="fn">unmap</span>(mapinfo)
+
+    <span class="cm"># Most common path on Jetson after nvvideoconvert</span>
+    <span class="kw">if</span> fmt <span class="kw">in</span> (<span class="st">'RGBA'</span>, <span class="st">'RGBx'</span>):
+        img = data.<span class="fn">reshape</span>(height, width, <span class="nu">4</span>)
+        <span class="kw">return</span> cv.<span class="fn">cvtColor</span>(img, cv.COLOR_RGBA2BGR)</code></pre>
+
+  <p>Supported pixel formats:</p>
+  <table>
+    <thead><tr><th>Format</th><th>Channels</th><th>Conversion</th></tr></thead>
+    <tbody>
+      <tr><td><code>RGBA</code>, <code>RGBx</code></td><td>4 (alpha unused)</td><td>RGBA &#8594; BGR via OpenCV</td></tr>
+      <tr><td><code>RGB</code></td><td>3</td><td>RGB &#8594; BGR via OpenCV</td></tr>
+      <tr><td><code>BGRx</code>, <code>BGRA</code></td><td>4 (alpha unused)</td><td>Slice first 3 channels</td></tr>
+      <tr><td><code>BGR</code></td><td>3</td><td>Copy as-is</td></tr>
+      <tr><td><code>NV12</code>, <code>I420</code></td><td>YUV planar</td><td>YUV &#8594; BGR via OpenCV</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Why return BGR and not RGB?</div>
+    OpenCV works natively in BGR. We return BGR here, then convert to RGB right before calling
+    the tracker. Keeping these steps separate makes intent clear:
+    buffer decoding returns OpenCV-native BGR; the tracker always receives RGB (training format).
+  </div>
+
+  <h2 id="app-state">Application State — <code>AppState</code></h2>
+  <p>
+    <code>AppState</code> holds everything the callback needs. Because GStreamer fires callbacks
+    from its own context, using a class instance avoids global variables.
+  </p>
+
+  <pre><code><span class="kw">class</span> <span class="nb">AppState</span>:
+    manager:      <span class="nb">TrackerManager</span>   <span class="cm"># runs SUTrack inference</span>
+    cfg:          dict              <span class="cm"># loaded YAML config</span>
+    output_path:  str               <span class="cm"># .mp4 save path, or empty string</span>
+    headless:     bool              <span class="cm"># True = no display window</span>
+
+    initialized:  bool              <span class="cm"># has ROI been selected yet?</span>
+    frame_idx:    int               <span class="cm"># frames sent to tracker (stale removal)</span>
+    frame_count:  int               <span class="cm"># frames with results (FPS averaging)</span>
+    total_time:   float             <span class="cm"># cumulative tracker wall-clock time</span>
+
+    writer:       cv.VideoWriter    <span class="cm"># MP4 writer — created lazily on first frame</span>
+    loop:         GLib.MainLoop     <span class="cm"># so callback can quit the loop on 'q'</span></code></pre>
+
+  <div class="callout tip">
+    <div class="callout-title">Lazy VideoWriter</div>
+    The <code>VideoWriter</code> is created on the first frame because the video resolution is
+    only known after the pipeline starts negotiating formats with the decoder.
+  </div>
+
+  <h2 id="callback">Appsink Callback — <code>on_new_sample()</code></h2>
+  <p>GStreamer calls this function once for every decoded frame.</p>
+
+  <div class="diagram"><span class="d-title">on_new_sample() FLOW</span>
+
+  GStreamer delivers frame
+         |
+         v
+  nvbuf_to_bgr()          --> NumPy BGR array
+         |
+         +-- first frame? --YES --> imshow() + selectROI()   (GUI mode)
+         |                          OR  --init_bbox value    (headless)
+         |                          --> manager.initialize(rgb, bbox)
+         |                          return OK
+         |
+         v  (subsequent frames)
+  cvtColor BGR->RGB        Critical Rule 5: model was trained on RGB
+         |
+  manager.update()         --> { obj_id: [x, y, w, h] }
+         |
+  draw green rectangle + "ID N" for each tracked object
+  draw red FPS counter top-left: "24.8 FPS | tracks: 1"
+         |
+         +-- VideoWriter.write()   (if --output was set)
+         +-- cv.imshow()           (if not --headless)
+               'q' pressed? --> loop.quit()
+         |
+  return Gst.FlowReturn.OK</div>
+
+  <h3>First Frame — Initializing the Tracker</h3>
+  <p>The tracker needs a template before it can track anything. Two ways to provide the initial bounding box:</p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">A</div>
+      <div class="step-body">
+        <h4>GUI Mode (default)</h4>
+        <p>
+          <code>cv.imshow()</code> is called <strong>before</strong> <code>cv.selectROI()</code>
+          to initialize the Qt window handler. Skipping this causes a NULL window crash on some
+          OpenCV builds. Draw a rectangle and press <strong>SPACE</strong> or <strong>ENTER</strong>.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">B</div>
+      <div class="step-body">
+        <h4>Headless Mode (<code>--init_bbox X Y W H</code>)</h4>
+        <p>Skips GUI entirely. Box comes from the command line. Ideal for CI, automated benchmarks, or SSH sessions without a display.</p>
+      </div>
+    </div>
+  </div>
+
+  <h3>Drawing Results</h3>
+  <p>
+    After <code>update()</code> returns a dict of <code>{ id → [x, y, w, h] }</code>, each box
+    is drawn as a <strong>green rectangle</strong> with the object ID above it.
+    A <strong>red FPS counter</strong> in the top-left shows tracking speed and active track count.
+  </p>
+
+  <h2 id="main">Main Function — Startup Sequence</h2>
+  <div class="steps">
+    <div class="step"><div class="step-num">1</div><div class="step-body">
+      <h4>Parse CLI Arguments</h4>
+      <p><code>--config</code>, <code>--input</code>, <code>--init_bbox</code>, <code>--output</code>, <code>--headless</code>, <code>--no-nvmm</code></p>
+    </div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-body">
+      <h4>Load YAML Config</h4>
+      <p>Parses <code>tracker_config.yml</code>. Any CLI value overrides its corresponding YAML value.</p>
+    </div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-body">
+      <h4>Resolve Engine Path</h4>
+      <pre><code>ROOT        = ~/SUTrack/deepstream/
+engine_path = normpath(join(ROOT, '../sutrack_fp32.engine'))
+            = ~/SUTrack/sutrack_fp32.engine</code></pre>
+    </div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-body">
+      <h4>Load TRT Engine</h4>
+      <p>Creates <code>SUTrackEngine</code> — deserializes the <code>.engine</code> file and allocates GPU buffers. Takes a few seconds.</p>
+    </div></div>
+    <div class="step"><div class="step-num">5</div><div class="step-body">
+      <h4>Create TrackerManager</h4>
+      <p>Wraps the engine with multi-object lifecycle logic. Passes crop factors, thresholds, <code>max_age</code>, Hanning flag.</p>
+    </div></div>
+    <div class="step"><div class="step-num">6</div><div class="step-body">
+      <h4>Build GStreamer Pipeline</h4>
+      <p>Calls <code>build_pipeline()</code>, connects the appsink signal and bus EOS/error handlers.</p>
+    </div></div>
+    <div class="step"><div class="step-num">7</div><div class="step-body">
+      <h4>Run GLib Main Loop</h4>
+      <p>Sets pipeline to <code>PLAYING</code> and blocks in <code>loop.run()</code> until EOS, error, or <kbd>q</kbd>. Then cleans up pipeline, VideoWriter, and OpenCV windows.</p>
+    </div></div>
+  </div>
+
+  <div class="callout tip">
+    <div class="callout-title">SSH Headless Tip</div>
+    No monitor connected? Use <code>nvvideoconvert compute-hw=1</code> (VIC mode, no EGL required)
+    to avoid the <em>"nvbufsurface: Failed to create EGLImage"</em> error.
+    Or set <code>export DISPLAY=:0</code> if a physical monitor is attached to the Jetson.
+  </div>
+
+  <div class="page-footer">
+    <div class="nav-links"><a href="index.html">&#8592; Overview</a></div>
+    <div class="nav-links"><a href="engine.html">Next: TensorRT Engine &#8594;</a></div>
+  </div>
+
+</main>
+</body>
+</html>

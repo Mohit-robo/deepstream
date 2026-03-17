@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Overview — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html" class="active">
+      <span class="nav-icon">🏠</span> Overview
+    </a>
+    <a href="pipeline.html">
+      <span class="nav-icon">🎬</span> GStreamer Pipeline
+    </a>
+    <a href="engine.html">
+      <span class="nav-icon">⚡</span> TensorRT Engine
+    </a>
+    <a href="tracker-logic.html">
+      <span class="nav-icon">🎯</span> Tracker Logic
+    </a>
+    <a href="multi-object.html">
+      <span class="nav-icon">👥</span> Multi-Object Manager
+    </a>
+  </nav>
+
+  <div class="sidebar-section">Quick Links</div>
+  <nav>
+    <a href="index.html#quickstart"><span class="nav-icon">🚀</span> Quick Start</a>
+    <a href="index.html#files"><span class="nav-icon">📁</span> File Structure</a>
+    <a href="index.html#rules"><span class="nav-icon">📌</span> Critical Rules</a>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ CONTENT -->
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">📖 Start Here</div>
+    <h1>SUTrack DeepStream Tracker</h1>
+    <p>
+      A production-ready, real-time object tracking application built on NVIDIA DeepStream
+      and GStreamer. Runs on Jetson hardware with zero PyTorch dependency at runtime —
+      pure NumPy preprocessing and a TensorRT FP32 engine.
+    </p>
+  </div>
+
+  <!-- ── What Does It Do ───────────────────────────────── -->
+  <h2>What Does This App Do?</h2>
+  <p>
+    SUTrack is an AI model that can <strong>track an object across a video</strong>, even when
+    the object moves, changes scale, or gets partially hidden. You point it at an object in the
+    first frame (by drawing a box), and it follows that object through every subsequent frame.
+  </p>
+  <p>
+    This DeepStream application wraps SUTrack in a hardware-accelerated video pipeline so it
+    runs efficiently on NVIDIA Jetson devices. Here is the big picture:
+  </p>
+
+  <div class="diagram"><span class="d-title">END-TO-END FLOW</span>
+
+<span class="d-arrow">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="d-arrow">│</span>  VIDEO SOURCE   →   HW DECODE   →   COLOR CONVERT   →   TRACKER   →  OUTPUT
+<span class="d-arrow">│</span>
+<span class="d-arrow">│</span>  file / camera       Jetson GPU      RGBA → BGR          SUTrack       screen
+<span class="d-arrow">│</span>  RTSP stream         nvv4l2decoder   via OpenCV          TRT engine    or MP4
+<span class="d-arrow">└─────────────────────────────────────────────────────────────────────────┘</span>
+
+Steps per frame:
+  1. GStreamer pulls a decoded frame buffer from the video source
+  2. Buffer is converted from GPU memory (NVMM) to a NumPy BGR array
+  3. BGR is converted to RGB  (model was trained on RGB)
+  4. SUTrack TRT engine predicts a new bounding box for each tracked object
+  5. Box is drawn on frame → displayed and/or saved to MP4</div>
+
+  <!-- ── Pipeline Diagram ──────────────────────────────── -->
+  <h2>Full Pipeline Diagram</h2>
+  <div class="diagram"><span class="d-title">GSTREAMER PIPELINE</span>
+
+  filesrc location=video.mp4
+       │
+  decodebin  (auto-selects nvv4l2decoder on Jetson — hardware decode)
+       │
+  nvvideoconvert compute-hw=0   (GPU: NVMM memory → system RAM, RGBA)
+       │
+  video/x-raw, format=RGBA
+       │
+  videoconvert                  (CPU: format normalization)
+       │
+  video/x-raw, format=RGBA
+       │
+  appsink  emit-signals=true  max-buffers=1  drop=true  sync=false
+       │
+       └─── on_new_sample() callback (Python) ──────────────────┐
+                 │                                               │
+         nvbuf_to_bgr()           map GstBuffer → NumPy BGR     │
+                 │                                               │
+         cv.cvtColor BGR→RGB      model expects RGB (Lesson 12) │
+                 │                                               │
+         TrackerManager.update()                                 │
+                 │                                               │
+         ┌───── per active tracker ────┐                         │
+         │  TrackerInstance.track()    │                         │
+         │    sample_target()          │  search crop extract    │
+         │    preprocess()             │  normalize (1,6,224,224)│
+         │    SUTrackEngine.infer()    │  TRT forward pass       │
+         │    hann2d * score_map       │  spatial suppression    │
+         │    argmax → peak (x, y)     │  find best location     │
+         │    decode cx/cy/w/h         │  map to image coords    │
+         │    position-only clamp      │  keep w/h, clamp x,y   │
+         └─────────────────────────────┘                         │
+                 │                                               │
+         draw bboxes + IDs → imshow / VideoWriter ──────────────┘</div>
+
+  <!-- ── File Structure ────────────────────────────────── -->
+  <h2 id="files">File Structure</h2>
+  <p>All files live inside <code>deepstream/</code> at the SUTrack repository root.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>File</th>
+        <th>What It Does</th>
+        <th>Docs Page</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>apps/deepstream_tracker_app.py</code></td>
+        <td>Main entry point. Builds the GStreamer pipeline, handles the appsink callback, manages video I/O.</td>
+        <td><a href="pipeline.html">Pipeline</a></td>
+      </tr>
+      <tr>
+        <td><code>tracker/tracker_utils.py</code></td>
+        <td>Pure-NumPy helpers: image normalization, crop extraction, Hanning window, IoU calculation.</td>
+        <td><a href="tracker-logic.html">Tracker Logic</a></td>
+      </tr>
+      <tr>
+        <td><code>tracker/sutrack_engine.py</code></td>
+        <td>Loads the TensorRT engine, allocates GPU buffers, runs inference.</td>
+        <td><a href="engine.html">TRT Engine</a></td>
+      </tr>
+      <tr>
+        <td><code>tracker/tracker_instance.py</code></td>
+        <td>Per-object state: stores template image, bounding box; runs one tracking step.</td>
+        <td><a href="tracker-logic.html#instance">Tracker Logic</a></td>
+      </tr>
+      <tr>
+        <td><code>tracker/tracker_manager.py</code></td>
+        <td>Manages multiple active trackers, IoU matching, stale removal.</td>
+        <td><a href="multi-object.html">Multi-Object</a></td>
+      </tr>
+      <tr>
+        <td><code>configs/tracker_config.yml</code></td>
+        <td>All tunable parameters — no values are hardcoded in Python files.</td>
+        <td><a href="index.html#config">Config Reference</a></td>
+      </tr>
+      <tr>
+        <td><code>scripts/build_engine.sh</code></td>
+        <td>Correct <code>trtexec</code> command to compile the FP32 engine from ONNX.</td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Quick Start ───────────────────────────────────── -->
+  <h2 id="quickstart">Quick Start</h2>
+
+  <h3>Step 1 — Build the TensorRT Engine (one time only)</h3>
+  <pre><code><span class="cm"># From the SUTrack repo root</span>
+<span class="kw">cd</span> ~/SUTrack
+
+<span class="cm"># Export the model to ONNX format</span>
+python tracking/export_onnx.py --param sutrack_t224
+
+<span class="cm"># Compile the TRT engine (FP32 — do NOT add --fp16)</span>
+bash deepstream/scripts/build_engine.sh sutrack.onnx sutrack_fp32.engine</code></pre>
+
+  <div class="callout rule">
+    <div class="callout-title">⛔ Critical: FP32 Only</div>
+    Never compile with <code>--fp16</code>. The sigmoid activation inside the TRT graph produces
+    values close to 0 in FP16 precision, making the tracker see no peaks and output a broken bounding box.
+  </div>
+
+  <h3>Step 2 — Run with GUI ROI selection</h3>
+  <pre><code>python deepstream/apps/deepstream_tracker_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4</code></pre>
+  <p>A window appears. Draw a rectangle around your target with the mouse, then press <strong>SPACE</strong> or <strong>ENTER</strong>.</p>
+
+  <h3>Step 3 — Run headless (no display, preset bounding box)</h3>
+  <pre><code>python deepstream/apps/deepstream_tracker_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --init_bbox 300 200 120 140 \
+    --output result.mp4 \
+    --headless</code></pre>
+
+  <!-- ── Config Reference ───────────────────────────────── -->
+  <h2 id="config">Config Reference (<code>tracker_config.yml</code>)</h2>
+  <pre><code>model:
+  engine_path: ../sutrack_fp32.engine  <span class="cm"># relative to deepstream/</span>
+  template_size: 112      <span class="cm"># template crop output size (pixels)</span>
+  search_size:   224      <span class="cm"># search crop output size (pixels)</span>
+  template_factor: 2.0   <span class="cm"># crop area = sqrt(w*h) * factor</span>
+  search_factor:   4.0
+  encoder_stride:  16    <span class="cm"># 224 / 16 = 14 → 14×14 feature map</span>
+  use_hanning_window: true
+
+tracker:
+  max_age:            30    <span class="cm"># frames before removing a lost tracker</span>
+  min_confidence:     0.25  <span class="cm"># minimum score to spawn a new tracker</span>
+  iou_match_threshold: 0.3  <span class="cm"># minimum IoU to match detection to track</span>
+
+pipeline:
+  input_source: ""   <span class="cm"># empty = camera; or file path / rtsp://...</span>
+  output_path:  ""   <span class="cm"># empty = display only; or a .mp4 path</span>
+  headless:     false
+  log_level:    INFO</code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Parameter</th><th>Meaning</th><th>Default</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>template_factor</code></td><td>How large the template crop is relative to the object size. Larger = more context.</td><td>2.0</td></tr>
+      <tr><td><code>search_factor</code></td><td>How large the search area is relative to the object. Larger = can track faster motion but slower.</td><td>4.0</td></tr>
+      <tr><td><code>max_age</code></td><td>How many frames a tracker lives without being matched. Increase for fast-moving objects that leave frame briefly.</td><td>30</td></tr>
+      <tr><td><code>use_hanning_window</code></td><td>Applies a spatial weight that suppresses false positives near crop edges.</td><td>true</td></tr>
+      <tr><td><code>encoder_stride</code></td><td>Internal model stride — changes the feature map size. Do not change unless you retrained the model.</td><td>16</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Critical Rules ────────────────────────────────── -->
+  <h2 id="rules">Critical Rules</h2>
+  <p>These rules come from hard-won debugging experience. Breaking any one of them produces subtle, hard-to-diagnose bugs.</p>
+
+  <div class="callout rule">
+    <div class="callout-title">Rule 1 — FP32 Engine Only</div>
+    Always compile the TRT engine without <code>--fp16</code>. FP16 underflows sigmoid outputs to near-zero → tracker breaks.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Rule 2 — No Double Sigmoid</div>
+    <code>score_map</code> and <code>size_map</code> are <strong>already sigmoid-activated inside the TRT graph</strong>. Applying sigmoid again in Python produces values stuck at ~0.5 — completely wrong.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Rule 3 — Position-Only Clamp</div>
+    When clamping the output bounding box to image boundaries, clamp only <code>x1, y1</code>. Never re-derive <code>w, h</code> from clamped corners — that causes the box to shrink to a line when the target is near the edge.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Rule 4 — Hanning Window Before argmax</div>
+    Apply the Hanning spatial penalty to the score map <em>before</em> finding the peak with <code>argmax</code>. Doing it after has no effect.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Rule 5 — BGR → RGB Before Every Tracker Call</div>
+    GStreamer and OpenCV produce BGR images. The model was trained on RGB. Convert with <code>cv.cvtColor(frame, cv.COLOR_BGR2RGB)</code> before passing any frame to the tracker.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Rule 6 — Named TRT Bindings</div>
+    Always access TensorRT tensors by name (<code>inputs['template']</code>), never by numeric index. Index order can change between engine versions.
+  </div>
+
+  <!-- ── Pages Guide ───────────────────────────────────── -->
+  <h2>Documentation Pages</h2>
+  <div class="card-grid">
+    <a class="card" href="pipeline.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">🎬</div>
+      <h4>GStreamer Pipeline</h4>
+      <p>How the video flows from file/camera through DeepStream into Python. Covers buffer conversion, appsink callbacks, and display logic.</p>
+    </a>
+    <a class="card" href="engine.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">⚡</div>
+      <h4>TensorRT Engine</h4>
+      <p>How the AI model is loaded and run on the GPU. Covers buffer allocation with <code>cuda.cudart</code> and the inference pipeline.</p>
+    </a>
+    <a class="card" href="tracker-logic.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">🎯</div>
+      <h4>Tracker Logic</h4>
+      <p>The core tracking algorithm: image preprocessing, crop extraction, the Hanning window trick, and post-processing of model outputs.</p>
+    </a>
+    <a class="card" href="multi-object.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">👥</div>
+      <h4>Multi-Object Manager</h4>
+      <p>How multiple objects are tracked simultaneously. Covers IoU-based matching, tracker lifecycle, and stale removal.</p>
+    </a>
+  </div>
+
+  <div class="page-footer">
+    <span style="font-size:13px;color:var(--muted)">SUTrack DeepStream Docs</span>
+    <div class="nav-links">
+      <a href="pipeline.html">Next: GStreamer Pipeline →</a>
+    </div>
+  </div>
+
+</main>
+</body>
+</html>

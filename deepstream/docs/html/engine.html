@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TensorRT Engine — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">&#127968;</span> Overview</a>
+    <a href="pipeline.html"><span class="nav-icon">&#127909;</span> GStreamer Pipeline</a>
+    <a href="engine.html" class="active"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+  </nav>
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#what-is-trt"><span class="nav-icon">&#10067;</span> What is TensorRT?</a>
+    <a href="#buffers"><span class="nav-icon">&#128190;</span> Buffer Allocation</a>
+    <a href="#engine-class"><span class="nav-icon">&#9889;</span> SUTrackEngine Class</a>
+    <a href="#infer"><span class="nav-icon">&#9654;</span> The infer() Method</a>
+    <a href="#why-fp32"><span class="nav-icon">&#9888;</span> Why FP32 Only?</a>
+    <a href="#named-bindings"><span class="nav-icon">&#128279;</span> Named Bindings</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#9889; tracker/sutrack_engine.py</div>
+    <h1>TensorRT Engine</h1>
+    <p>How the SUTrack AI model is loaded onto the GPU and run efficiently using TensorRT. This is where frames become bounding box predictions.</p>
+  </div>
+
+  <h2 id="what-is-trt">What is TensorRT?</h2>
+  <p>
+    TensorRT is NVIDIA's inference optimizer. It takes a trained neural network (exported as ONNX)
+    and compiles it into a highly optimized <strong>engine file</strong> tuned for a specific GPU.
+    The engine runs much faster than a plain PyTorch model because TensorRT fuses layers, picks
+    optimal kernel implementations, and pre-allocates memory.
+  </p>
+  <p>
+    Once the engine is compiled (a one-time step), inference only needs:
+    <strong>TensorRT</strong>, <strong>cuda-python</strong> (<code>cuda.cudart</code>), and
+    <strong>NumPy</strong> — no PyTorch required.
+  </p>
+
+  <div class="diagram"><span class="d-title">ENGINE LIFECYCLE</span>
+
+  Training (PyTorch)
+       |
+       v  export_onnx.py
+  sutrack.onnx
+       |
+       v  trtexec (one-time compile, ~3 min on Jetson Orin)
+  sutrack_fp32.engine    &lt;-- lives at ~/SUTrack/ (repo root)
+       |
+       v  SUTrackEngine.__init__()  (at app startup)
+  deserialized TRT runtime + execution context
+       |
+       v  SUTrackEngine.infer()     (called every frame, per tracker)
+  score_map, size_map, offset_map, pred_boxes</div>
+
+  <h2 id="buffers">Buffer Allocation — <code>HostDeviceMem</code> and <code>_allocate_buffers()</code></h2>
+
+  <h3>The Memory Problem</h3>
+  <p>
+    TensorRT runs on the GPU. To feed it data, we need to:
+  </p>
+  <ol>
+    <li>Allocate <strong>pinned host memory</strong> — CPU RAM that the GPU can DMA from directly (faster than regular RAM)</li>
+    <li>Allocate <strong>device memory</strong> — memory on the GPU itself</li>
+    <li>Copy data host → device before inference, device → host after</li>
+  </ol>
+
+  <h3><code>HostDeviceMem</code> — Paired Buffer</h3>
+  <p>
+    A simple container that keeps the host and device pointers for one tensor together:
+  </p>
+  <pre><code><span class="kw">class</span> <span class="nb">HostDeviceMem</span>:
+    <span class="cm"># One tensor's paired CPU + GPU memory</span>
+    host:   np.ndarray   <span class="cm"># pinned NumPy array (CPU side)</span>
+    device: int          <span class="cm"># raw GPU pointer (device side)</span>
+    name:   str          <span class="cm"># tensor name e.g. 'template', 'score_map'</span></code></pre>
+
+  <h3><code>_allocate_buffers()</code> — How Memory Is Allocated</h3>
+  <p>
+    This function is called once at engine startup. It loops over every tensor in the engine
+    (inputs and outputs) and allocates both a pinned host buffer and a GPU device buffer.
+  </p>
+
+  <pre><code><span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(engine.num_io_tensors):
+    name  = engine.<span class="fn">get_tensor_name</span>(i)        <span class="cm"># by name, never by index</span>
+    dtype = trt.<span class="fn">nptype</span>(engine.<span class="fn">get_tensor_dtype</span>(name))
+    shape = engine.<span class="fn">get_tensor_shape</span>(name)
+
+    <span class="cm"># Allocate pinned host memory (CPU, DMA-accessible)</span>
+    err, host_ptr = cudart.<span class="fn">cudaMallocHost</span>(nbytes)
+    host_np = np.<span class="fn">frombuffer</span>(
+        (ctypes.c_char * nbytes).<span class="fn">from_address</span>(<span class="fn">int</span>(host_ptr)),
+        dtype=dtype).<span class="fn">reshape</span>(shape)
+
+    <span class="cm"># Allocate device memory (GPU)</span>
+    err, device_ptr = cudart.<span class="fn">cudaMalloc</span>(nbytes)
+
+    <span class="cm"># Sort into inputs or outputs dict</span>
+    is_input = engine.<span class="fn">get_tensor_mode</span>(name) == trt.TensorIOMode.INPUT
+    (inputs <span class="kw">if</span> is_input <span class="kw">else</span> outputs)[name] = <span class="nb">HostDeviceMem</span>(host_np, device_ptr, name)</code></pre>
+
+  <div class="callout tip">
+    <div class="callout-title">Why cuda.cudart instead of pycuda?</div>
+    <code>pycuda</code> requires a compiled extension and has compatibility issues on some
+    Jetson JetPack versions. <code>cuda-python</code> (<code>from cuda import cudart</code>)
+    is a thin Python wrapper around the CUDA runtime C library — it is included in JetPack
+    and works reliably on all Jetson devices.
+  </div>
+
+  <p>The three input tensors and their shapes:</p>
+  <table>
+    <thead><tr><th>Name</th><th>Shape</th><th>What it contains</th></tr></thead>
+    <tbody>
+      <tr><td><code>template</code></td><td><code>(1, 6, 112, 112)</code></td><td>Normalized template crop of the target object (float32)</td></tr>
+      <tr><td><code>search</code></td><td><code>(1, 6, 224, 224)</code></td><td>Normalized search region around the previous position (float32)</td></tr>
+      <tr><td><code>template_anno</code></td><td><code>(1, 4)</code></td><td>Normalized [x1, y1, w, h] of the target inside the template crop (float32)</td></tr>
+    </tbody>
+  </table>
+
+  <p>The four output tensors:</p>
+  <table>
+    <thead><tr><th>Name</th><th>Shape</th><th>What it contains</th></tr></thead>
+    <tbody>
+      <tr><td><code>score_map</code></td><td><code>(1, 1, 14, 14)</code></td><td>Confidence score for each location in the 14x14 feature grid. Already sigmoid-activated inside the graph.</td></tr>
+      <tr><td><code>size_map</code></td><td><code>(1, 2, 14, 14)</code></td><td>Predicted normalized width and height at each grid cell.</td></tr>
+      <tr><td><code>offset_map</code></td><td><code>(1, 2, 14, 14)</code></td><td>Sub-pixel x/y offset from each grid cell center.</td></tr>
+      <tr><td><code>pred_boxes</code></td><td><code>(1, 4)</code></td><td>Direct box prediction (used as a cross-check; postprocessing uses the maps above).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 2 — No Double Sigmoid</div>
+    <code>score_map</code> and <code>size_map</code> are already sigmoid-activated
+    <strong>inside the TRT computation graph</strong>. Do not call <code>sigmoid()</code>
+    on them in Python. Doing so maps already-small values (e.g. 0.6) through sigmoid again,
+    producing values stuck near 0.5 — the tracker sees a flat score map and tracks nothing correctly.
+  </div>
+
+  <h2 id="engine-class">SUTrackEngine Class</h2>
+  <p>
+    <code>SUTrackEngine</code> is created once at startup and shared by all
+    <code>TrackerInstance</code> objects. There is only one TRT context and one set of buffers.
+    Inference calls are made sequentially — one tracker at a time per frame.
+  </p>
+
+  <pre><code><span class="kw">class</span> <span class="nb">SUTrackEngine</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, engine_path, template_size=<span class="nu">112</span>,
+                 search_size=<span class="nu">224</span>, encoder_stride=<span class="nu">16</span>):
+
+        self.feat_sz = search_size // encoder_stride  <span class="cm"># 224 // 16 = 14</span>
+
+        <span class="cm"># Load and deserialize engine</span>
+        <span class="kw">with</span> <span class="fn">open</span>(engine_path, <span class="st">'rb'</span>) <span class="kw">as</span> f, trt.<span class="nb">Runtime</span>(TRT_LOGGER) <span class="kw">as</span> runtime:
+            self.engine = runtime.<span class="fn">deserialize_cuda_engine</span>(f.<span class="fn">read</span>())
+
+        <span class="cm"># Create execution context and set fixed input shapes</span>
+        self.context = self.engine.<span class="fn">create_execution_context</span>()
+        self.context.<span class="fn">set_input_shape</span>(<span class="st">'template'</span>,      (<span class="nu">1</span>, <span class="nu">6</span>, <span class="nu">112</span>, <span class="nu">112</span>))
+        self.context.<span class="fn">set_input_shape</span>(<span class="st">'search'</span>,        (<span class="nu">1</span>, <span class="nu">6</span>, <span class="nu">224</span>, <span class="nu">224</span>))
+        self.context.<span class="fn">set_input_shape</span>(<span class="st">'template_anno'</span>, (<span class="nu">1</span>, <span class="nu">4</span>))
+
+        <span class="cm"># Allocate all GPU buffers once</span>
+        self.inputs, self.outputs, self.bindings, self.stream = \
+            <span class="fn">_allocate_buffers</span>(self.engine, template_size, search_size)</code></pre>
+
+  <div class="callout info">
+    <div class="callout-title">Shared Engine Design</div>
+    All <code>TrackerInstance</code> objects share this one engine. Each tracker copies its own
+    template and search crops into the shared buffers before calling <code>infer()</code>.
+    This is correct because the engine is <em>stateless</em> — the per-object state
+    (template image, bounding box) lives in Python, not inside TensorRT.
+    The benefit is that we avoid duplicating the large engine weights in GPU memory
+    for each tracked object.
+  </div>
+
+  <h2 id="infer">The <code>infer()</code> Method</h2>
+  <p>
+    This is the method every <code>TrackerInstance</code> calls once per frame. It does four things:
+  </p>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Copy inputs to host buffers</h4>
+        <p>Uses <code>np.copyto()</code> to fill the pre-allocated pinned host arrays with the current tracker's template, search crop, and annotation.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Host to Device (H2D) copy</h4>
+        <p>Asynchronously copies each input from pinned CPU RAM to GPU memory using <code>cudaMemcpyAsync</code> on the CUDA stream.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>TRT forward pass</h4>
+        <p><code>context.execute_async_v2()</code> runs the neural network on the GPU asynchronously on the same CUDA stream.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Device to Host (D2H) copy + sync</h4>
+        <p>Copies each output tensor back to host memory, then <code>cudaStreamSynchronize()</code> waits for all GPU operations to complete before returning.</p>
+      </div>
+    </div>
+  </div>
+
+  <pre><code><span class="kw">def</span> <span class="fn">infer</span>(self, template_img, search_img, template_anno) -> dict:
+    <span class="cm"># Step 1: copy inputs into shared host buffers</span>
+    np.<span class="fn">copyto</span>(self.inputs[<span class="st">'template'</span>].host,      template_img)
+    np.<span class="fn">copyto</span>(self.inputs[<span class="st">'search'</span>].host,        search_img)
+    np.<span class="fn">copyto</span>(self.inputs[<span class="st">'template_anno'</span>].host, template_anno)
+
+    <span class="cm"># Step 2: H2D — host to device (async)</span>
+    <span class="kw">for</span> inp <span class="kw">in</span> self.inputs.<span class="fn">values</span>():
+        cudart.<span class="fn">cudaMemcpyAsync</span>(inp.device, inp.host.ctypes.data,
+            inp.host.nbytes, cudaMemcpyHostToDevice, self.stream)
+
+    <span class="cm"># Step 3: TRT forward pass (async)</span>
+    self.context.<span class="fn">execute_async_v2</span>(bindings=self.bindings,
+                                    stream_handle=self.stream)
+
+    <span class="cm"># Step 4: D2H — device to host (async) + sync</span>
+    <span class="kw">for</span> out <span class="kw">in</span> self.outputs.<span class="fn">values</span>():
+        cudart.<span class="fn">cudaMemcpyAsync</span>(out.host.ctypes.data, out.device,
+            out.host.nbytes, cudaMemcpyDeviceToHost, self.stream)
+    cudart.<span class="fn">cudaStreamSynchronize</span>(self.stream)
+
+    <span class="kw">return</span> {name: mem.host <span class="kw">for</span> name, mem <span class="kw">in</span> self.outputs.<span class="fn">items</span>()}</code></pre>
+
+  <h2 id="why-fp32">Why FP32 Only?</h2>
+  <p>
+    The SUTrack decoder uses <strong>sigmoid activations</strong> to produce confidence scores
+    and size predictions. In float32, sigmoid outputs a value between 0 and 1 as expected.
+    In float16, values close to zero underflow to exactly 0 due to limited precision.
+  </p>
+
+  <div class="diagram"><span class="d-title">SIGMOID UNDERFLOW IN FP16</span>
+
+  Example: logit value = -3.2
+
+  FP32 sigmoid:   1 / (1 + exp(3.2))  = 0.0391   correct small confidence
+  FP16 sigmoid:   1 / (1 + exp(3.2))  = 0.0000   underflows to zero
+
+  Effect:
+    FP32 score_map: values in [0.01 .. 0.85]    --> clear peak visible
+    FP16 score_map: all values = 0.000           --> no peak, tracker broken</div>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 1 — FP32 Engine Only</div>
+    Always compile the engine without <code>--fp16</code>. The correct trtexec command is:
+    <pre style="margin-top:10px"><code>trtexec --onnx=sutrack.onnx --saveEngine=sutrack_fp32.engine \
+    --minShapes=template:1x6x112x112,search:1x6x224x224,template_anno:1x4 \
+    --optShapes=template:1x6x112x112,search:1x6x224x224,template_anno:1x4 \
+    --maxShapes=template:1x6x112x112,search:1x6x224x224,template_anno:1x4 \
+    --memPoolSize=workspace:4096MiB</code></pre>
+  </div>
+
+  <h2 id="named-bindings">Why Named TRT Bindings?</h2>
+  <p>
+    Older TensorRT APIs accessed tensors by numeric index (0, 1, 2 ...). The index order could
+    change between TRT versions or engine recompilations, silently feeding data to the wrong tensor.
+  </p>
+  <p>
+    This engine always uses <strong>named access</strong>:
+  </p>
+  <pre><code><span class="cm"># WRONG — index order is fragile</span>
+self.inputs[<span class="nu">0</span>].host = template_img
+
+<span class="cm"># CORRECT — name is stable across TRT versions</span>
+self.inputs[<span class="st">'template'</span>].host = template_img</code></pre>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical Rule 6 — Named Bindings Always</div>
+    Access TRT tensors by name, never by numeric index.
+    Index order is an implementation detail that can change silently.
+  </div>
+
+  <div class="page-footer">
+    <div class="nav-links"><a href="pipeline.html">&#8592; GStreamer Pipeline</a></div>
+    <div class="nav-links"><a href="tracker-logic.html">Next: Tracker Logic &#8594;</a></div>
+  </div>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# DeepStream PGIE (Primary GIE) Config — Phase 4.3 placeholder
+# Fill in model-engine-file and labelfile-path for your detector before use.
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-engine-file=deepstream/models/detector.engine    # <-- set your detector TRT engine path here
+labelfile-path=deepstream/configs/labels.txt           # <-- set your class labels file here
+batch-size=1
+network-mode=0                              # 0=FP32, 1=INT8, 2=FP16
+num-detected-classes=80                     # adjust to your model
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0                              # 0=Detector
+cluster-mode=2
+
+[class-attrs-all]
+threshold=0.25
+roi-top-offset=0
+roi-bottom-offset=0
+detected-min-w=0
+detected-min-h=0
+detected-max-w=0
+detected-max-h=0

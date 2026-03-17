@@ -1,0 +1,35 @@
+# SUTrack DeepStream — Tracker Configuration
+# All paths are relative to the deepstream/ directory (SUTrack/deepstream/).
+
+model:
+  engine_path: ../sutrack_fp32.engine    # compiled FP32 TRT engine (FP16 NOT supported)
+  template_size: 112                      # template crop output size (pixels)
+  search_size: 224                        # search crop output size (pixels)
+  template_factor: 2.0                    # crop factor for template extraction
+  search_factor: 4.0                      # crop factor for search extraction
+  encoder_stride: 16                      # encoder patch stride (feat_sz = search_size / stride)
+  use_hanning_window: true                # apply Hanning spatial penalty before argmax
+
+tracker:
+  max_age: 30                # frames a tracker can go unmatched before removal
+  min_confidence: 0.25       # minimum detector confidence to spawn a new tracker
+  iou_match_threshold: 0.3   # minimum IoU to match a detection to an existing track
+  static_roi: ""             # Optional: "X,Y,W,H" to skip manual selection (e.g., "300,200,100,100")
+  # static_roi: "201, 294, 116, 288"             # Optional: "X,Y,W,H" to skip manual selection (e.g., "300,200,100,100")
+
+pipeline:
+  input_source: ""           # video file path, RTSP URL, or "" for camera (device 0)
+  output_path: ""            # Phase 4 only: save annotated MP4 here; "" = display only
+  headless: false            # true = no display window (Phase 5: use RTSP stream instead)
+  log_level: INFO            # DEBUG / INFO / WARNING
+
+  # --- Phase 5: nvstreammux resolution (must match or be >= source resolution) ---
+  width:  1280               # pipeline frame width  (nvstreammux output)
+  height:  720               # pipeline frame height (nvstreammux output)
+
+  # --- Phase 5: RTSP streaming ---
+  rtsp_enabled: true         # enable hardware H.264 encoding + RTSP server
+  rtsp_port: 8554            # GstRtspServer listen port
+  rtsp_udp_port: 5400        # internal UDP port (pipeline -> RTSP server bridge)
+  rtsp_path: /sutrack         # RTSP mount path  (e.g. rtsp://<ip>:8554/sutrack)
+  rtsp_bitrate: 4000000      # H.264 target bitrate in bps (4 Mbps default)

@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Object Manager — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">&#127968;</span> Overview</a>
+    <a href="pipeline.html"><span class="nav-icon">&#127909;</span> GStreamer Pipeline</a>
+    <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
+    <a href="multi-object.html" class="active"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+  </nav>
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#overview"><span class="nav-icon">&#128200;</span> Overview</a>
+    <a href="#lifecycle"><span class="nav-icon">&#9851;</span> Tracker Lifecycle</a>
+    <a href="#initialize"><span class="nav-icon">&#9997;</span> initialize()</a>
+    <a href="#update"><span class="nav-icon">&#9654;</span> update()</a>
+    <a href="#iou-matching"><span class="nav-icon">&#128257;</span> IoU Matching</a>
+    <a href="#stale"><span class="nav-icon">&#128465;</span> Stale Removal</a>
+    <a href="#iou-math"><span class="nav-icon">&#128290;</span> compute_iou()</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#128101; tracker/tracker_manager.py</div>
+    <h1>Multi-Object Manager</h1>
+    <p>How multiple objects are tracked simultaneously, how detections are matched to existing tracks, and how lost tracks are cleaned up.</p>
+  </div>
+
+  <h2 id="overview">Overview</h2>
+  <p>
+    <code>TrackerManager</code> sits between the GStreamer pipeline and the individual
+    <code>TrackerInstance</code> objects. Its job is to:
+  </p>
+  <ul>
+    <li>Keep a pool of active <code>TrackerInstance</code> objects, one per tracked object</li>
+    <li>Call each tracker's <code>track()</code> method every frame (sequential, shared engine)</li>
+    <li>Match incoming detector bounding boxes to existing tracks using IoU</li>
+    <li>Spawn new trackers for unmatched detections</li>
+    <li>Remove trackers that haven't been matched for too long</li>
+  </ul>
+
+  <div class="diagram"><span class="d-title">TRACKERMANAGER POSITION IN THE STACK</span>
+
+  AppState (callback)
+       |
+       v
+  TrackerManager.initialize()      called once when user picks ROI
+  TrackerManager.update()          called every frame
+       |
+       +--- TrackerInstance[0].track(frame, engine)
+       +--- TrackerInstance[1].track(frame, engine)   (sequential, shared engine)
+       +--- TrackerInstance[N].track(frame, engine)
+       |
+       v
+  IoU match new detections to existing tracks
+       |
+       +--- matched:   update last_seen_frame (keep tracker alive)
+       +--- unmatched + high confidence:  spawn new TrackerInstance
+       |
+  remove_stale()   delete trackers not seen for > max_age frames
+       |
+       v
+  return { obj_id: [x, y, w, h], ... }</div>
+
+  <h2 id="lifecycle">Tracker Lifecycle</h2>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Born</h4>
+        <p>A new <code>TrackerInstance</code> is created via <code>initialize()</code> — either from manual user selection, or when a detector reports a new high-confidence object that doesn't match any existing track.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Active — tracked every frame</h4>
+        <p><code>update()</code> calls <code>track()</code> on every active instance each frame. The instance updates its <code>state</code> and <code>last_seen_frame</code>.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Matched by detector (optional, Phase 4.3)</h4>
+        <p>When a PGIE detector is attached, its bounding boxes are matched to existing tracks by IoU. A successful match refreshes <code>last_seen_frame</code>, keeping the tracker alive even if the pure-tracking confidence drops.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Stale — too many frames without a match</h4>
+        <p>If a tracker's <code>last_seen_frame</code> falls more than <code>max_age</code> frames behind the current frame, it is deleted. Default: 30 frames.</p>
+      </div>
+    </div>
+  </div>
+
+  <h2 id="initialize">initialize() — Creating a New Tracker</h2>
+  <pre><code><span class="kw">def</span> <span class="fn">initialize</span>(self, frame_rgb, bbox, frame_idx=<span class="nu">0</span>) -> int:
+    obj_id = self._next_id
+    self._next_id += <span class="nu">1</span>
+
+    inst = <span class="nb">TrackerInstance</span>(
+        object_id      = obj_id,
+        template_factor= self.template_factor,
+        search_factor  = self.search_factor,
+        template_size  = self.engine.template_size,
+        search_size    = self.engine.search_size,
+        feat_sz        = self.engine.feat_sz,
+        use_hanning    = self.use_hanning,
+    )
+    inst.<span class="fn">initialize</span>(frame_rgb, bbox, frame_idx)
+    self.active_trackers[obj_id] = inst
+    <span class="kw">return</span> obj_id</code></pre>
+
+  <p>
+    Object IDs are assigned from a monotonically increasing counter <code>_next_id</code>.
+    IDs are never reused — if tracker ID 2 is removed and a new object appears, it gets ID 3.
+    This prevents ID confusion in downstream consumers.
+  </p>
+
+  <h2 id="update">update() — The Per-Frame Loop</h2>
+  <pre><code><span class="kw">def</span> <span class="fn">update</span>(self, frame_rgb, frame_idx,
+           detections=<span class="kw">None</span>) -> dict:
+
+    results = {}
+
+    <span class="cm"># Run tracking for every active tracker (sequential — shared engine)</span>
+    <span class="kw">for</span> obj_id, inst <span class="kw">in</span> <span class="fn">list</span>(self.active_trackers.<span class="fn">items</span>()):
+        <span class="kw">try</span>:
+            bbox = inst.<span class="fn">track</span>(frame_rgb, self.engine, frame_idx)
+            results[obj_id] = bbox
+        <span class="kw">except</span> Exception <span class="kw">as</span> e:
+            <span class="cm"># Remove faulty tracker rather than crashing the whole pipeline</span>
+            <span class="kw">del</span> self.active_trackers[obj_id]
+
+    <span class="cm"># Optional: match detector boxes and spawn new trackers</span>
+    <span class="kw">if</span> detections:
+        self.<span class="fn">_match_and_spawn</span>(frame_rgb, frame_idx, detections, results)
+
+    self.<span class="fn">remove_stale</span>(frame_idx)
+    <span class="kw">return</span> results</code></pre>
+
+  <div class="callout info">
+    <div class="callout-title">Sequential Inference — Why Not Parallel?</div>
+    All <code>TrackerInstance</code> objects share <strong>one</strong> <code>SUTrackEngine</code>
+    (one TRT context, one set of GPU buffers). Parallelism would require multiple engines and
+    multiply GPU memory usage by the number of tracked objects. Sequential is correct and
+    efficient for typical tracker counts (1–5 objects).
+  </div>
+
+  <h2 id="iou-matching">IoU Matching — Connecting Detections to Tracks</h2>
+  <p>
+    When a detector (Phase 4.3 PGIE) provides bounding boxes for the current frame,
+    the manager must decide: does each detection correspond to an object we are already
+    tracking, or is it a new object?
+  </p>
+  <p>
+    The answer is computed with <strong>Intersection over Union (IoU)</strong>:
+    how much do the detector's box and the tracker's predicted box overlap?
+  </p>
+
+  <div class="diagram"><span class="d-title">IoU MATCHING ALGORITHM</span>
+
+  Active tracks:      T0:[100,50,60,80]    T1:[300,200,50,70]
+  New detections:     D0:[105,52,58,79]    D1:[400,100,40,60]    D2:[295,198,55,75]
+
+  Compute IoU matrix:
+              D0      D1      D2
+    T0:      0.92    0.01    0.04
+    T1:      0.00    0.03    0.88
+
+  Greedy match (highest IoU first, threshold=0.3):
+    T0 -> D0  (IoU=0.92) matched    D0 marked as used
+    T1 -> D2  (IoU=0.88) matched    D2 marked as used
+
+  Unmatched detection:
+    D1 (IoU with all tracks below 0.3)
+    confidence(D1) >= min_confidence ?
+      YES --> spawn new TrackerInstance for D1
+      NO  --> ignore D1</div>
+
+  <pre><code><span class="cm"># Greedy IoU matching inside update()</span>
+matched_det_indices = set()
+
+<span class="kw">for</span> obj_id <span class="kw">in</span> tracked_ids:
+    best_iou, best_det_idx = <span class="nu">0.0</span>, -<span class="nu">1</span>
+    <span class="kw">for</span> i, det <span class="kw">in</span> <span class="fn">enumerate</span>(detections):
+        <span class="kw">if</span> i <span class="kw">in</span> matched_det_indices:
+            <span class="kw">continue</span>
+        iou = <span class="fn">compute_iou</span>(results[obj_id], det[<span class="st">'bbox'</span>])
+        <span class="kw">if</span> iou > best_iou:
+            best_iou, best_det_idx = iou, i
+
+    <span class="kw">if</span> best_iou >= self.iou_match_threshold:
+        matched_det_indices.<span class="fn">add</span>(best_det_idx)
+        self.active_trackers[obj_id].last_seen_frame = frame_idx   <span class="cm"># keep alive</span>
+
+<span class="cm"># Spawn new trackers for unmatched high-confidence detections</span>
+<span class="kw">for</span> i, det <span class="kw">in</span> <span class="fn">enumerate</span>(detections):
+    <span class="kw">if</span> i <span class="kw">not in</span> matched_det_indices:
+        <span class="kw">if</span> det.<span class="fn">get</span>(<span class="st">'confidence'</span>, <span class="nu">1.0</span>) >= self.min_confidence:
+            self.<span class="fn">initialize</span>(frame_rgb, det[<span class="st">'bbox'</span>], frame_idx)</code></pre>
+
+  <table>
+    <thead><tr><th>Parameter</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>iou_match_threshold</code></td><td>0.3</td><td>Minimum IoU to consider a detection matched to an existing track. Lower = more permissive matching.</td></tr>
+      <tr><td><code>min_confidence</code></td><td>0.25</td><td>Minimum detector confidence to spawn a new tracker. Prevents spawning trackers on weak detections.</td></tr>
+      <tr><td><code>max_age</code></td><td>30</td><td>Frames a tracker survives without being matched before deletion.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="stale">Stale Tracker Removal — <code>remove_stale()</code></h2>
+  <p>
+    When an object leaves the frame or becomes occluded, the tracker keeps running — it may
+    drift to a wrong position. After <code>max_age</code> frames without a detector match,
+    the tracker is removed.
+  </p>
+
+  <pre><code><span class="kw">def</span> <span class="fn">remove_stale</span>(self, current_frame: int):
+    stale = [oid <span class="kw">for</span> oid, inst <span class="kw">in</span> self.active_trackers.<span class="fn">items</span>()
+             <span class="kw">if</span> (current_frame - inst.last_seen_frame) > self.max_age]
+    <span class="kw">for</span> oid <span class="kw">in</span> stale:
+        <span class="kw">del</span> self.active_trackers[oid]</code></pre>
+
+  <p>
+    In Phase 4.2 (manual init, no detector), <code>last_seen_frame</code> is updated every
+    time <code>track()</code> succeeds — so trackers are only removed if <code>track()</code>
+    raises an exception. In Phase 4.3 (with PGIE detector), <code>last_seen_frame</code> is
+    refreshed on IoU matches, allowing the detector to "rescue" a tracker that is drifting.
+  </p>
+
+  <h2 id="iou-math">IoU Calculation — <code>compute_iou()</code></h2>
+  <p>
+    IoU (Intersection over Union) measures how much two boxes overlap.
+    A value of 1.0 means perfect overlap; 0.0 means no overlap at all.
+  </p>
+
+  <div class="diagram"><span class="d-title">IoU FORMULA</span>
+
+  Box A: [ax1, ay1, aw, ah]      Box B: [bx1, by1, bw, bh]
+
+  Intersection:
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax1+aw, bx1+bw)
+    iy2 = min(ay1+ah, by1+bh)
+    inter_area = max(0, ix2-ix1) * max(0, iy2-iy1)
+
+  Union:
+    union_area = area(A) + area(B) - inter_area
+
+  IoU = inter_area / union_area
+
+  Example:
+    A = [100, 50, 60, 80]   area = 4800
+    B = [110, 55, 60, 80]   area = 4800
+    Intersection = 50 * 70  = 3500
+    Union        = 4800 + 4800 - 3500 = 6100
+    IoU          = 3500 / 6100 = 0.574</div>
+
+  <pre><code><span class="kw">def</span> <span class="fn">compute_iou</span>(box_a: list, box_b: list) -> float:
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+
+    inter_x1 = <span class="fn">max</span>(ax1, bx1)
+    inter_y1 = <span class="fn">max</span>(ay1, by1)
+    inter_x2 = <span class="fn">min</span>(ax1 + aw, bx1 + bw)
+    inter_y2 = <span class="fn">min</span>(ay1 + ah, by1 + bh)
+
+    inter = <span class="fn">max</span>(<span class="nu">0.0</span>, inter_x2 - inter_x1) * <span class="fn">max</span>(<span class="nu">0.0</span>, inter_y2 - inter_y1)
+    union = aw * ah + bw * bh - inter
+    <span class="kw">return</span> inter / union <span class="kw">if</span> union > <span class="nu">0</span> <span class="kw">else</span> <span class="nu">0.0</span></code></pre>
+
+  <h2>num_active Property</h2>
+  <p>
+    A simple read-only property used by the display code to show how many objects are
+    currently being tracked in the FPS counter.
+  </p>
+  <pre><code><span class="dk">@property</span>
+<span class="kw">def</span> <span class="fn">num_active</span>(self) -> int:
+    <span class="kw">return</span> <span class="fn">len</span>(self.active_trackers)</code></pre>
+
+  <div class="callout tip">
+    <div class="callout-title">Phase 4.3 — Adding a Detector</div>
+    To attach a PGIE detector (Phase 4.3), the pipeline is extended with
+    <code>nvinfer</code> and a pad probe that reads <code>NvDsObjectMeta</code> detection boxes.
+    Those boxes are passed as the <code>detections</code> argument to <code>update()</code>.
+    The IoU matching and spawn logic is already implemented — only the pipeline wiring
+    and probe code need to be added.
+  </div>
+
+  <div class="page-footer">
+    <div class="nav-links"><a href="tracker-logic.html">&#8592; Tracker Logic</a></div>
+    <div class="nav-links"><a href="index.html">Back to Overview &#8594;</a></div>
+  </div>
+
+</main>
+</body>
+</html>
