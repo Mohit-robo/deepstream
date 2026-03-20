@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V3: Hybrid Tracking — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">🏠</span> Overview</a>
+    <a href="install.html"><span class="nav-icon">📦</span> Installation</a>
+    
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">🐢</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html" class="active"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">🎯</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">👥</span> Multi-Object Manager</a>
+  </nav>
+
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#overview"><span class="nav-icon">&#128200;</span> Overview</a>
+    <a href="#architecture"><span class="nav-icon">&#127959;</span> Architecture (Phase 8)</a>
+    <a href="#stabilization"><span class="nav-icon">&#128279;</span> Stabilization Logic</a>
+    <a href="#reselection"><span class="nav-icon">&#128257;</span> Mid-Stream Switching</a>
+    <a href="#phase10"><span class="nav-icon">&#128640;</span> Phase 10: State Machine</a>
+    <a href="#app-utils"><span class="nav-icon">&#128295;</span> app_utils.py</a>
+    <a href="#config"><span class="nav-icon">&#128196;</span> Config Reference</a>
+    <a href="#test-cases"><span class="nav-icon">&#9989;</span> Test Cases</a>
+    <a href="#bugs-fixed"><span class="nav-icon">&#128027;</span> Bugs Fixed</a>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ CONTENT -->
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#129309; Phase 8 &amp; 10 — apps/deepstream_nvtracker_v3.py</div>
+    <h1>V3: Hybrid Tracking</h1>
+    <p>
+      Phase 8/10 combines DeepStream's native multi-object tracker (<code>nvtracker</code> / NvDCF)
+      with the high-precision SUTrack TensorRT engine. It introduces a live OSD selection, Re-ID
+      persistence, and a LOCKED/SEARCHING/STALE state machine.
+    </p>
+  </div>
+
+  <!-- ── Overview ───────────────────────────────────────── -->
+  <h2 id="overview">Overview: Why Two Trackers?</h2>
+
+  <table>
+    <thead>
+      <tr><th>Tracker</th><th>Strength</th><th>Weakness</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>nvtracker (NvDCF)</strong></td>
+        <td>Multi-object, GPU-native, DeepStream-integrated, maintains global IDs</td>
+        <td>IDs can drift during long occlusions; bounding boxes less precise than SOT</td>
+      </tr>
+      <tr>
+        <td><strong>SUTrack (SOT)</strong></td>
+        <td>High-precision single-object tracking, robust to appearance change</td>
+        <td>Single object only; no global ID; can drift if object leaves frame entirely</td>
+      </tr>
+      <tr>
+        <td><strong>Hybrid (Phase 8)</strong></td>
+        <td>Precise SUTrack box + stable nvtracker ID correlation via IoU matching</td>
+        <td>Requires PGIE for initial detection; more complex pipeline</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Architecture ───────────────────────────────────── -->
+  <h2 id="architecture">Pipeline Architecture</h2>
+
+  <div class="diagram"><span class="d-title">GSTREAMER PIPELINE (deepstream_nvtracker_app.py)</span>
+
+  filesrc / v4l2src
+       │
+  decodebin  (nvv4l2decoder on Jetson)
+       │
+  nvvideoconvert compute-hw=1  +  capsfilter (NVMM RGBA)
+       │
+  nvstreammux  batch-size=1
+       │
+  nvinfer  (PGIE — ResNet-10 INT8 detector)   [interval set to 10000 after selection]
+       │
+  nvtracker  ll-lib=libnvds_nvdcf.so  ll-config=nvdcf_config.txt
+       │  → assigns native object_id to all detected objects each frame
+       │
+  nvvideoconvert compute-hw=1   (bridge: nvinfer → nvdsosd format)
+       │
+  nvdsosd
+       │  ← PAD PROBE: read frame + nvtracker metadata → run SUTrack → write NvDsObjectMeta
+       │
+  queue ── nv3dsink / fakesink   [display branch]</div>
+
+  <h3>What the Probe Does Each Frame</h3>
+  <ol>
+    <li>Extract RGBA frame from NVMM buffer as NumPy array</li>
+    <li>Convert RGBA → RGB for SUTrack preprocessing</li>
+    <li>Run <code>TrackerManager.update(frame_rgb, frame_idx)</code> → SUTrack bounding boxes</li>
+    <li>For each SUTrack box: iterate all <code>NvDsObjectMeta</code> (nvtracker objects), compute IoU</li>
+    <li>If IoU &gt; 0.5 with a native object → log the native ID correlation</li>
+    <li>Write a new <code>NvDsObjectMeta</code> for the SUTrack result (teal box, "SUTrack [ID] (Stabilized)" label)</li>
+  </ol>
+
+  <!-- ── Stabilization ──────────────────────────────────── -->
+  <h2 id="stabilization">ID Stabilization Logic</h2>
+
+  <div class="diagram"><span class="d-title">STABILIZATION FLOW (per SUTrack output box)</span>
+
+  SUTrack output: [sx, sy, sw, sh]
+        │
+        ▼
+  For each NvDsObjectMeta from nvtracker:
+    nv_bbox = [rect.left, rect.top, rect.width, rect.height]
+    iou = get_iou(sutrack_bbox, nv_bbox)
+    if iou > max_iou:
+        max_iou = iou
+        best_match_meta = obj_meta
+        │
+        ▼
+  if best_match_meta:
+      log "ID Correction: SUTrack X matching native Y"
+      # SUTrack's precise box "wins", native ID logged for correlation
+        │
+  nvds_acquire_obj_meta → write SUTrack box + "Stabilized" label</div>
+
+  <p>
+    The IoU threshold is <strong>0.5</strong> (hardcoded minimum to prevent false matches).
+    The SUTrack box is always drawn regardless of whether a native match is found — the
+    native ID correlation is informational only and does not block rendering.
+  </p>
+
+  <!-- ── Reselection ────────────────────────────────────── -->
+  <h2 id="reselection">Mid-Stream Target Switching</h2>
+
+  <p>
+    At any point during tracking, type <code>s</code> + <strong>ENTER</strong> in the terminal.
+    An <code>input_listener</code> daemon thread sets <code>state.trigger_reselect = True</code>.
+    The GStreamer probe detects this flag, captures the current frame + object metadata, and
+    sets <code>state.frame_ready</code> to wake the <code>select_loop</code> thread.
+  </p>
+
+  <div class="diagram"><span class="d-title">MID-STREAM RESELECTION FLOW</span>
+
+  Terminal: user types "s" + ENTER
+        │
+  input_listener thread:  state.trigger_reselect = True
+        │
+  GStreamer probe (next frame):
+    captures frame_rgba + current detections
+    state.frame_ready.set()
+        │
+  select_loop thread (wakes on frame_ready):
+    state.frame_ready.clear()
+    select_bbox_click_to_select(frame, detections)  → user clicks new target
+    state.manager.active_trackers.clear()           ← drop old tracker
+    state.manager.initialize(frame_rgb, new_bbox, frame_idx=current_idx)
+        │
+  Probe continues — now tracking new target</div>
+
+  <div class="callout rule">
+    <div class="callout-title">Critical: active_trackers must be cleared before re-init</div>
+    Without <code>state.manager.active_trackers.clear()</code>, the old tracker continues
+    running alongside the new one. Both compute SUTrack boxes every frame, doubling inference
+    load and generating two overlapping "Stabilized" labels.
+  </div>
+
+  <div class="callout note">
+    <div class="callout-title">frame_ready must be cleared in main() after initial wait</div>
+    After the first frame is captured and the user makes their initial selection,
+    <code>state.frame_ready.clear()</code> MUST be called before the <code>select_loop</code>
+    thread starts. Without this clear, <code>select_loop</code> wakes immediately (the event
+    is still set from the initial probe) and shows the GUI again as if a reselection was
+    requested.
+  </div>
+
+  <!-- ── Phase 10 ───────────────────────────────────────── -->
+  <h2 id="phase10">Phase 10: <code>deepstream_nvtracker_v3.py</code> — Evolution</h2>
+
+  <p>
+    Phase 10 addresses three limitations of Phase 8:
+    the pipeline-freeze during selection,
+    permanent loss when a target re-enters the frame with a new ID,
+    and the lack of clean auto-stop behaviour.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Capability</th><th>Phase 8</th><th>Phase 10 (V3)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Selection UI</td>
+        <td>OpenCV click window; pipeline pauses</td>
+        <td>Snap &amp; Re-Sync; stdin controls</td>
+      </tr>
+      <tr>
+        <td>Target lost</td>
+        <td>Drifts indefinitely</td>
+        <td><code>SEARCHING</code> → Re-ID → re-attach</td>
+      </tr>
+      <tr>
+        <td>Re-entry after frame exit</td>
+        <td>Permanently lost</td>
+        <td>IoU + histogram Re-ID</td>
+      </tr>
+      <tr>
+        <td>OSD feedback</td>
+        <td><code>SUTrack [ID] (Stabilized)</code></td>
+        <td><code>[LOCKED]</code> / <code>[SEARCHING...]</code> / <code>[TARGET LOST]</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>State Machine</h3>
+
+  <div class="diagram"><span class="d-title">PHASE 10 STATE MACHINE (deepstream_nvtracker_v3.py)</span>
+
+  IDLE ──(user selects)──► LOCKED ──(conf &lt; 0.20 × 150f)──► SEARCHING
+                             ▲                                     │
+                             │    (IoU &gt;0.35 or hist &gt;0.58)       │
+                             └─────────────── Re-ID ───────────────┘
+                                                                   │
+                                            (timeout 150f) ──► STALE
+                                                                   │
+                                               ('s' keypress) ──► IDLE</div>
+
+  <h3>Snap &amp; Re-Sync: How Non-Blocking Selection Works</h3>
+
+  <div class="diagram"><span class="d-title">NON-BLOCKING SELECTION FLOW</span>
+
+  Timer (1 s after start) or 's' keypress:
+    state.selection_active = True
+
+  GStreamer probe (every frame while selection_active):
+    → copies RGBA frame + detections to state.snapshot_frame/snapshot_dets
+    → state.snapshot_ready.set()   ← wakes GUI thread
+    → returns immediately          ← pipeline keeps running
+
+  selection_thread:
+    → shows click-to-select window on latest snapshot
+    → user picks object
+    → state.pending_init = {x, y, w, h, tracker_id}
+    → state.selection_active = False
+
+  GStreamer probe (next frame):
+    → reads pending_init
+    → looks up tracker_id in LIVE nvtracker metadata
+    → initializes SUTrack from LIVE position (not stale snapshot)
+    → state → LOCKED</div>
+
+  <div class="callout note">
+    <div class="callout-title">Re-Sync advantage on live feeds</div>
+    If the user takes 5 seconds to click, the nvtracker has been tracking the object
+    for those 5 seconds. The SUTrack template is initialized from the <em>current</em>
+    position, not from a 5-second-old snapshot. No video freeze, no coordinate jump.
+  </div>
+
+  <h3>Re-ID Strategy</h3>
+  <p>Two-tier matching in <code>_reid_scan()</code>:</p>
+  <ol>
+    <li><strong>IoU spatial match (threshold 0.35)</strong> — object returned to roughly the same area. Fast, no pixel computation.</li>
+    <li><strong>Histogram appearance match (threshold 0.58)</strong> — H-S histogram (50&times;60 bins) of the candidate crop vs stored template. Uses Bhattacharyya distance converted to similarity.</li>
+  </ol>
+
+  <h3>New Config Key</h3>
+  <pre><code>tracker:
+  hibernate_after: 150   <span class="cm"># frames of low confidence before STALE (default 150)</span></code></pre>
+
+  <!-- ── app_utils ──────────────────────────────────────── -->
+  <h2 id="app-utils">Shared Utilities: <code>app_utils.py</code></h2>
+
+  <p>
+    Phase 8 extracted common boilerplate into <code>deepstream/apps/app_utils.py</code>
+    to avoid code duplication between the Phase 5/6 and Phase 8 apps.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Function / Constant</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>select_bbox_click_to_select(frame_rgba, detections)</code></td><td>Show detection boxes, wait for left-click, return full detection dict. Main thread only.</td></tr>
+      <tr><td><code>manual_roi_select(frame_rgba)</code></td><td>Classic <code>cv2.selectROI</code> fallback — draw a box manually.</td></tr>
+      <tr><td><code>get_iou(boxA, boxB)</code></td><td>IoU between two <code>[x,y,w,h]</code> boxes. Used in probe for nvtracker correlation.</td></tr>
+      <tr><td><code>setup_rtsp_server(rtsp_port, udp_port, mount_path)</code></td><td>Create and attach <code>GstRtspServer</code>. Returns server instance or <code>None</code> if unavailable.</td></tr>
+      <tr><td><code>setup_logging(level_str)</code></td><td>Standardized log format across all apps.</td></tr>
+      <tr><td><code>get_local_ip()</code></td><td>Probe local IP for RTSP URL display.</td></tr>
+      <tr><td><code>CLASS_COLORS</code></td><td>BGR color list indexed by PGIE class ID (Car=green, Bicycle=orange, Person=sky, Roadsign=magenta).</td></tr>
+      <tr><td><code>TrackingState</code> (Phase 10)</td><td>Enum: <code>IDLE</code>, <code>LOCKED</code>, <code>SEARCHING</code>, <code>STALE</code>.</td></tr>
+      <tr><td><code>IDHistory</code> (Phase 10)</td><td>Appearance store: <code>update()</code>, <code>match_score()</code>, <code>clear()</code>. Used for Re-ID after re-entry.</td></tr>
+      <tr><td><code>compute_crop_histogram(frame_rgb, bbox)</code> (Phase 10)</td><td>H-S 50×60 histogram of an RGB crop for Re-ID.</td></tr>
+      <tr><td><code>compare_histograms(hist1, hist2)</code> (Phase 10)</td><td>Bhattacharyya distance → 0..1 similarity. 1.0 = identical appearance.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Config ─────────────────────────────────────────── -->
+  <h2 id="config">Config Reference (Phase 8 keys)</h2>
+
+  <pre><code>pipeline:
+  # Phase 8: nvtracker (NvDCF) settings
+  nvdcf_config: configs/nvdcf_config.txt   <span class="cm"># NvDCF algorithm config (ll-config-file)</span>
+  nvtracker_width: 640                      <span class="cm"># tracker processing width  (&lt;= pipeline width)</span>
+  nvtracker_height: 384                     <span class="cm"># tracker processing height (&lt;= pipeline height)</span>
+
+  # Reused from Phase 6
+  pgie_config: configs/pgie_config.txt     <span class="cm"># PGIE detector config</span>
+  pgie_one_shot: true                       <span class="cm"># freeze detector after selection</span></code></pre>
+
+  <h3>nvdcf_config.txt (NvDCF Algorithm Parameters)</h3>
+  <pre><code>[VisualTracker]
+SearchRegionScale=1.6          # how wide to search for the object
+FilterStrength=0.075           # lower = smoother but slower to adapt
+MinTrackingConfidence=0.1      # below this threshold object is considered lost</code></pre>
+
+  <h3>nvtracker GStreamer Properties</h3>
+  <p>These are set directly in Python — the <code>nvtracker_config.txt</code> file is for <code>deepstream-app</code> CLI use only.</p>
+
+  <table>
+    <thead>
+      <tr><th>Property</th><th>Value</th><th>Why</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>ll-lib-file</code></td><td><code>libnvds_nvdcf.so</code></td><td>NvDCF is the recommended tracker on Jetson (GPU-native)</td></tr>
+      <tr><td><code>ll-config-file</code></td><td><code>configs/nvdcf_config.txt</code></td><td>NvDCF algorithm parameters — NOT the nvtracker wrapper config</td></tr>
+      <tr><td><code>tracker-width</code></td><td>640</td><td>Tracker processes frames at this width (lower = faster)</td></tr>
+      <tr><td><code>tracker-height</code></td><td>384</td><td>Tracker processes frames at this height</td></tr>
+      <tr><td><code>gpu-id</code></td><td>0</td><td>Explicit GPU selection</td></tr>
+      <tr><td><code>enable-batch-process</code></td><td>1</td><td>Required for batch pipeline compatibility</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Test Cases ─────────────────────────────────────── -->
+  <h2 id="test-cases">Test Cases (Verification)</h2>
+
+  <h3>TC1 — Click-to-Select Initialization</h3>
+  <pre><code>python3 deepstream/apps/deepstream_nvtracker_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4</code></pre>
+  <p><strong>Pass:</strong> After clicking a box, a teal border labeled <code>SUTrack [0] (Stabilized)</code> appears immediately.</p>
+
+  <h3>TC2 — ID Persistence (Occlusion)</h3>
+  <p>Track an object that briefly passes behind another object.</p>
+  <p><strong>Pass:</strong> SUTrack box remains on the target through the occlusion. Log shows <code>ID Correction: SUTrack 0 matching native &lt;id&gt;</code> when the object reappears.</p>
+
+  <h3>TC3 — Mid-Stream Target Switching</h3>
+  <pre><code><span class="cm"># While app is running, in the terminal:</span>
+s
+<span class="cm"># Press ENTER</span></code></pre>
+  <p><strong>Pass:</strong> Selection window opens. Clicking Object B drops Object A immediately (only one "Stabilized" label visible).</p>
+
+  <h3>TC4 — PGIE One-Shot Optimization</h3>
+  <p>Set <code>pgie_one_shot: true</code> in config (default). After first selection, verify in logs:</p>
+  <pre><code>INFO  probe: PGIE Sleep mode (Phase 7)</code></pre>
+  <p><strong>Pass:</strong> PGIE interval set to 10000. nvtracker continues tracking via motion model without continuous detector hits.</p>
+
+  <!-- ── Bugs Fixed ─────────────────────────────────────── -->
+  <h2 id="bugs-fixed">Bugs Fixed During Code Review</h2>
+
+  <table>
+    <thead>
+      <tr><th>#</th><th>Bug</th><th>Location</th><th>Fix Applied</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><code>ll-config-file</code> pointed to <code>nvtracker_config.txt</code> (the wrapper config) instead of <code>nvdcf_config.txt</code> (the algorithm config). nvtracker would fail to parse the [VisualTracker] section.</td>
+        <td><code>build_pipeline()</code> line 287</td>
+        <td>Changed to <code>os.path.join(ROOT, 'configs/nvdcf_config.txt')</code></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><code>frame_ready</code> not cleared in <code>main()</code> after initial wait. <code>select_loop</code> thread would immediately fire (event still set) and open the selection GUI again.</td>
+        <td><code>main()</code> after line 369</td>
+        <td>Added <code>state.frame_ready.clear()</code> after <code>wait()</code></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><code>active_trackers</code> not cleared before reselection. Old tracker continued running alongside new one — two "Stabilized" boxes drawn, doubled inference load.</td>
+        <td><code>select_loop()</code> before initialize</td>
+        <td>Added <code>state.manager.active_trackers.clear()</code></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><code>frame_idx=0</code> hardcoded in <code>select_loop</code> reselection call. Template stored with wrong frame reference.</td>
+        <td><code>select_loop()</code> initialize call</td>
+        <td>Changed to <code>cur_idx = state.frame_idx</code> captured at selection time</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><code>txt.font_params.font_name</code> and <code>font_size</code> not set. nvdsosd renders text at size 0 — label invisible.</td>
+        <td>Probe text overlay</td>
+        <td>Added <code>font_name = 'Serif'</code> and <code>font_size = 11</code></td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td>nvtracker <code>gpu-id</code> and <code>enable-batch-process</code> not set. Required for correct batch pipeline operation.</td>
+        <td><code>build_pipeline()</code> nvtracker setup</td>
+        <td>Added both properties explicitly</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:2rem">
+    <a href="v2_native.html" class="card" style="text-decoration:none">
+      <div class="card-title">← PGIE Click-to-Select</div>
+      <div class="card-body">How Phase 6 uses a detector to suggest ROI candidates.</div>
+    </a>
+    <a href="multi-object.html" class="card" style="text-decoration:none">
+      <div class="card-title">Multi-Object Manager →</div>
+      <div class="card-body">TrackerManager lifecycle, IoU matching, and stale removal.</div>
+    </a>
+  </div>
+
+</main>
+</body>
+</html>

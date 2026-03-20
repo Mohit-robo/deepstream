@@ -20,27 +20,19 @@
 
   <div class="sidebar-section">Navigation</div>
   <nav>
-    <a href="index.html" class="active">
-      <span class="nav-icon">🏠</span> Overview
-    </a>
-    <a href="install.html">
-      <span class="nav-icon">📦</span> Installation
-    </a>
-    <a href="pipeline.html">
-      <span class="nav-icon">🎬</span> GStreamer Pipeline
-    </a>
-    <a href="engine.html">
-      <span class="nav-icon">⚡</span> TensorRT Engine
-    </a>
-    <a href="tracker-logic.html">
-      <span class="nav-icon">🎯</span> Tracker Logic
-    </a>
-    <a href="multi-object.html">
-      <span class="nav-icon">👥</span> Multi-Object Manager
-    </a>
-    <a href="pgie.html">
-      <span class="nav-icon">🖱️</span> PGIE Click-to-Select
-    </a>
+    <a href="index.html" class="active"><span class="nav-icon">🏠</span> Overview</a>
+    <a href="install.html"><span class="nav-icon">📦</span> Installation</a>
+    
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">🐢</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">🎯</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">👥</span> Multi-Object Manager</a>
   </nav>
 
   <div class="sidebar-section">Quick Links</div>
@@ -137,14 +129,29 @@ Steps per frame (after init):
     </thead>
     <tbody>
       <tr>
+        <td><code>apps/deepstream_desktop_app.py</code></td>
+        <td><strong>Phase 11 (V4 Recommended)</strong> — GTK3 GUI, async TRT worker (~60 FPS in tracking), hardware video canvas.</td>
+        <td><a href="v4_desktop.html">V4: Desktop App</a></td>
+      </tr>
+      <tr>
+        <td><code>apps/deepstream_nvtracker_v3.py</code> &amp; <code>_app.py</code></td>
+        <td>Phase 8/10 (V3) — Hybrid tracking (nvtracker + SUTrack correlation) and state machine.</td>
+        <td><a href="v3_hybrid.html">V3: Hybrid Tracking</a></td>
+      </tr>
+      <tr>
         <td><code>apps/deepstream_rtsp_app.py</code></td>
-        <td><strong>Phase 5/6 (recommended)</strong> — NvDsOsd + RTSP streaming + PGIE click-to-select ROI.</td>
-        <td><a href="pipeline.html">Pipeline</a></td>
+        <td>Phase 5/6 (V2) — NvDsOsd hardware drawing + RTSP streaming + PGIE click-to-select ROI.</td>
+        <td><a href="v2_native.html">V2: Native OSD &amp; RTSP</a></td>
       </tr>
       <tr>
         <td><code>apps/deepstream_tracker_app.py</code></td>
-        <td>Phase 4 (legacy) — appsink pipeline, OpenCV drawing, manual ROI selection.</td>
-        <td><a href="pipeline.html">Pipeline</a></td>
+        <td>Phase 4 (V1 legacy) — appsink pulling frames to CPU, OpenCV drawing, manual ROI.</td>
+        <td><a href="v1_legacy.html">V1: Legacy OpenCV</a></td>
+      </tr>
+      <tr>
+        <td><code>apps/app_utils.py</code></td>
+        <td>Shared utilities — <code>select_bbox_click_to_select</code>, <code>setup_rtsp_server</code>, <code>get_iou</code>, <code>CLASS_COLORS</code>.</td>
+        <td><a href="v3_hybrid.html#app-utils">V3: Hybrid Tracking</a></td>
       </tr>
       <tr>
         <td><code>tracker/tracker_utils.py</code></td>
@@ -174,7 +181,12 @@ Steps per frame (after init):
       <tr>
         <td><code>configs/pgie_config.txt</code></td>
         <td>DeepStream ResNet-10 INT8 detector config used by Phase 6 click-to-select ROI.</td>
-        <td><a href="pgie.html">PGIE</a></td>
+        <td><a href="v2_native.html">V2: Native OSD &amp; RTSP</a></td>
+      </tr>
+      <tr>
+        <td><code>configs/nvdcf_config.txt</code></td>
+        <td>NvDCF algorithm parameters (<code>SearchRegionScale</code>, <code>FilterStrength</code>, <code>MinTrackingConfidence</code>) — Phase 8.</td>
+        <td><a href="v3_hybrid.html#config">V3: Hybrid Tracking</a></td>
       </tr>
       <tr>
         <td><code>scripts/build_engine.sh</code></td>
@@ -304,10 +316,25 @@ pipeline:
       <h4>Installation</h4>
       <p>Step-by-step setup from a bare JetPack image: DeepStream SDK, GStreamer RTSP server, pyds wheel, Python packages, and full verification commands.</p>
     </a>
-    <a class="card" href="pipeline.html" style="text-decoration:none;color:inherit;">
+    <a class="card" href="v1_legacy.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">🐢</div>
+      <h4>V1: Legacy OpenCV</h4>
+      <p>Our V1 tracker bridging DeepStream and SUTrack. Uses Appsink to pull frames to the CPU and OpenCV for rendering. Covers buffer conversion and display logic.</p>
+    </a>
+    <a class="card" href="v2_native.html" style="text-decoration:none;color:inherit;">
       <div class="card-icon">🎬</div>
-      <h4>GStreamer Pipeline</h4>
-      <p>How the video flows from file/camera through DeepStream into Python. Covers buffer conversion, appsink callbacks, and display logic.</p>
+      <h4>V2: Native OSD &amp; RTSP</h4>
+      <p>Our V2 hardware-accelerated pipeline. Uses nvdsosd for drawing, RTSP for streaming, and a PGIE ResNet-10 detector for click-to-select initialization.</p>
+    </a>
+    <a class="card" href="v3_hybrid.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">🤝</div>
+      <h4>V3: Hybrid Tracking</h4>
+      <p>Our V3 app bridging NVIDIA's nvtracker (NvDCF) and SUTrack in a single pipeline. Correlates global native IDs to precise SOT bounding boxes via Spatial IoU.</p>
+    </a>
+    <a class="card" href="v4_desktop.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">💻</div>
+      <h4>V4: GTK Desktop App</h4>
+      <p>Our final production V4 app. Wraps the tracking pipeline inside a native Linux window, provides UI buttons, handles Re-ID, and unlocks 60 FPS using an async TRT worker thread.</p>
     </a>
     <a class="card" href="engine.html" style="text-decoration:none;color:inherit;">
       <div class="card-icon">⚡</div>
@@ -324,17 +351,12 @@ pipeline:
       <h4>Multi-Object Manager</h4>
       <p>How multiple objects are tracked simultaneously. Covers IoU-based matching, tracker lifecycle, and stale removal.</p>
     </a>
-    <a class="card" href="pgie.html" style="text-decoration:none;color:inherit;">
-      <div class="card-icon">🖱️</div>
-      <h4>PGIE Click-to-Select</h4>
-      <p>How Phase 6 uses a DeepStream object detector on the first frame and lets the user click an object to initialize the tracker. Covers thread safety, fallback chain, and PGIE config.</p>
-    </a>
   </div>
 
   <div class="page-footer">
     <span style="font-size:13px;color:var(--muted)">SUTrack DeepStream Docs</span>
     <div class="nav-links">
-      <a href="pipeline.html">Next: GStreamer Pipeline →</a>
+      <a href="install.html">Next: Installation →</a>
     </div>
   </div>
 

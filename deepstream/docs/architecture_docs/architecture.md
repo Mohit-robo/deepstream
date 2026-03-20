@@ -1,6 +1,49 @@
 # DeepStream SUTrack - Architecture
 
-## Pipeline (Phase 6 - PGIE + Click-to-Select ROI, Current)
+## Pipeline (Phase 8/9 - Hybrid Tracking, CURRENT)
+
+The hybrid pipeline leverages **nvtracker** (NvDCF) for global object persistence and **SUTrack** for high-precision bounding box refinement of a selected target.
+
+```
+Video / Camera
+      |
+      V
+  filesrc / v4l2src
+      |
+  decodebin (HW decode)
+      |
+  nvvideoconvert (NVMM:RGBA)
+      |
+  nvstreammux
+      |
+  nvinfer (PGIE) -> [Detector boxes attached to obj_meta]
+      |
+  nvtracker (NvDCF) -> [Candidate IDs assigned to obj_meta]
+      |
+  nvvideoconvert (Bridge)
+      |
+      V
+  [PAD PROBE on nvdsosd sink pad]
+      |
+      |   1. Get frame_rgb (cv2.cvtColor from NVMM surface)
+      |   2. Find Native Leader: Scan obj_meta for state.target_id
+      |   3. Run SUTrack: state.manager.update(frame_rgb)
+      |   4. Skeptical Re-Sync (Phase 9):
+      |      Only trust Native Leader if SUTrack confidence is low (< 0.2)
+      |      OR if geometric distance > 50% box width.
+      |   5. Debug Overlays (Phase 9):
+      |      If --debug-boxes: pyds.nvds_acquire_display_meta_from_pool()
+      |                        Draw Teal (Raw SUTrack) and Yellow (Raw Native)
+      |   6. Meta Correction:
+      |      Update the matched Native obj_meta.rect_params with SUTrack output.
+      |      Set label to "STABLE [ID]".
+      |
+  nvdsosd (NVMM Rendering)
+      |
+   Branch A (Display) / Branch B (RTSP)
+```
+
+## Pipeline (Phase 6 - PGIE + Click-to-Select ROI)
 
 ```
 Video / Camera

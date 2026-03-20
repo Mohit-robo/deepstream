@@ -172,26 +172,34 @@ All `TrackerInstance` objects should share **one TRT context** to avoid GPU memo
 
 ---
 
-# System Architecture
+   Main thread (ROI selection, runs while probe is blocked):
+      state.frame_ready.wait()     <- waits for probe to capture first frame
+      select_bbox_click_to_select()  <- OpenCV window, PGIE boxes drawn, user clicks
+          OR manual_roi_select()     <- fallback: draw box with mouse
+      manager.initialize(frame_rgb, bbox)
+      state.init_done.set()        <- unblocks probe thread
 
-```
-Video Source (file / RTSP / camera)
-    │
-nvdec (hardware decoder)
-    │
-nvstreammux
-    │
-nvinfer (PGIE — object detector, e.g. YOLOv8-NMS)
-    │
-Python Probe / Custom nvtracker plugin
-    │   ├── extract frame (NvBufSurface → np / cv2)
-    │   ├── TrackerManager.update(frame_rgb, detections)
-    │   └── write bboxes back to NvDsObjectMeta
-    │
-nvdsosd (on-screen display)
-    │
-sink (file / RTSP / display)
-```
+---
+
+# Hybrid Tracking & Anti-Drift (Phase 8/9 - Current)
+
+The current production state uses a **Hybrid Siamese-NvDCF** architecture:
+
+1. **NvDCF Leader**: DeepStream's `nvtracker` maintains global ID persistence.
+2. **SUTrack Stabilizer**: SUTrack runs on the selected target to provide pixel-precise box refinement.
+3. **Skeptical Re-Sync**: Anti-drift logic that only trusts the NvDCF leader when SUTrack confidence is low, preventing "leader poisoning" during occlusions.
+4. **Debug Visualization**: `--debug-boxes` flag for viewing raw tracker internals.
+
+---
+
+# Roadmap: Desktop App & Dynamic Persistence (Phase 10)
+
+Phase 10 features:
+- **GTK3 Desktop App** (`deepstream_desktop_app.py`): Hardware-accelerated video embedded in native window via `set_window_handle()`. Select/Prev/Next/Lock/Cancel buttons + keyboard shortcuts control OSD target cycling without a terminal.
+- **TRTWorkerThread**: Decouples TRT inference from the GStreamer streaming thread. Probe submits frames non-blocking; worker publishes results atomically. Pipeline runs at source FPS even when TRT inference takes ~30 ms.
+- **Live OSD Selection**: Candidate bounding boxes highlighted via `nvdsosd` during `SELECTING` state. Yellow thick border, left-to-right sorted.
+- **Appearance Re-ID**: H-S histogram signature computed while LOCKED. Re-identifies returning targets via Bhattacharyya distance matching.
+- **Dynamic Lifecycle**: Hot-swapping targets mid-stream, cancel-to-IDLE, SEARCHING/STALE states.
 
 ---
 

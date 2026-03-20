@@ -101,34 +101,10 @@ if ROOT not in sys.path:
 
 from tracker.sutrack_engine import SUTrackEngine
 from tracker.tracker_manager import TrackerManager
-
-# ---------------------------------------------------------------------------
-# Per-class box colors (BGR for OpenCV) used in the click-to-select GUI
-# Class indices: 0=Car, 1=Bicycle, 2=Person, 3=Roadsign
-# ---------------------------------------------------------------------------
-_CLASS_COLORS = [
-    (0,   255, 0),    # green  -- Car
-    (255, 128, 0),    # orange -- Bicycle
-    (0,   128, 255),  # sky    -- Person
-    (255, 0,   255),  # magenta -- Roadsign
-]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def load_yaml(path):
-    with open(path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-def setup_logging(level_str):
-    level = getattr(logging, level_str.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S')
+from app_utils import (
+    load_yaml, setup_logging, setup_rtsp_server, get_local_ip,
+    manual_roi_select, select_bbox_click_to_select, CLASS_COLORS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +112,7 @@ def setup_logging(level_str):
 # ---------------------------------------------------------------------------
 
 class AppState:
-    def __init__(self, manager, cfg, headless, pgie_enabled=False, pgie_config_path=''):
+    def __init__(self, manager, cfg, headless, pgie_enabled=False, pgie_config_path='', pgie_one_shot=True):
         self.manager     = manager
         self.cfg         = cfg
         self.headless    = headless
@@ -144,6 +120,7 @@ class AppState:
         # Phase 6: PGIE support
         self.pgie_enabled = pgie_enabled
         self.pgie_config_path = pgie_config_path
+        self.pgie_one_shot = pgie_one_shot
         self.pgie_element = None # Reference to nvinfer element for optimization
         self.first_frame_detections = [] # list of dicts: [x,y,w,h,class_id,label,conf]
 
@@ -158,110 +135,7 @@ class AppState:
         self.loop        = None    # GLib.MainLoop set by main()
 
 
-# ---------------------------------------------------------------------------
-# Click-to-Select GUI (runs in main thread only -- Lesson 25)
-# ---------------------------------------------------------------------------
-
-def select_bbox_click_to_select(frame_rgba, detections):
-    """
-    Display the first frame with PGIE detection boxes drawn as coloured overlays.
-    The user LEFT-CLICKS on the target object; the smallest enclosing box is
-    returned as [x, y, w, h].
-
-    Returns [x, y, w, h] on selection, or None if the user presses Q / ESC
-    to fall back to manual selectROI.
-
-    MUST be called from the main thread (Lesson 25).
-    """
-    log = logging.getLogger('gui')
-
-    frame_bgr = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-
-    # Draw each detected box with a class-coloured rectangle + label
-    for det in detections:
-        x, y, w, h = det['x'], det['y'], det['w'], det['h']
-        class_id    = det['class_id']
-        label       = det['label'] or ('cls%d' % class_id)
-        conf        = det['confidence']
-        color       = _CLASS_COLORS[class_id % len(_CLASS_COLORS)]
-
-        cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
-        tag = '%s %.2f' % (label, conf)
-        cv2.putText(frame_bgr, tag,
-                    (x, max(y - 4, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
-
-    # Instruction banner
-    cv2.putText(frame_bgr,
-                'CLICK object to track.  Q / ESC = manual ROI.',
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 255), 2, cv2.LINE_AA)
-
-    win_name = 'Click-to-Select Object'
-    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
-    cv2.imshow(win_name, frame_bgr)
-
-    # Shared result dict -- updated by the mouse callback
-    result = {'selected': None, 'done': False}
-
-    def on_click(event, cx, cy, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        best      = None
-        best_area = float('inf')
-        for det in detections:
-            dx, dy, dw, dh = det['x'], det['y'], det['w'], det['h']
-            if dx <= cx <= dx + dw and dy <= cy <= dy + dh:
-                area = dw * dh
-                if area < best_area:
-                    best_area = area
-                    best = [dx, dy, dw, dh]
-        if best is not None:
-            param['selected'] = best
-            param['done']     = True
-            log.info('Click-to-select: box=%s', best)
-        else:
-            log.warning('Click at (%d, %d) did not land inside any detection.', cx, cy)
-
-    cv2.setMouseCallback(win_name, on_click, result)
-
-    # Poll until a valid click or the user cancels
-    while not result['done']:
-        key = cv2.waitKey(50) & 0xFF
-        if key == ord('q') or key == 27:   # Q or ESC
-            log.info('Click-to-select cancelled -- falling back to manual ROI.')
-            break
-
-    cv2.destroyWindow(win_name)
-    cv2.waitKey(1)   # flush the window close event
-
-    return result['selected']   # None if cancelled
-
-
-def manual_roi_select(frame_rgba):
-    """
-    Classic OpenCV selectROI on the captured frame.
-    Returns [x, y, w, h] or None if cancelled (0-sized selection).
-
-    MUST be called from the main thread (Lesson 25).
-    """
-    disp     = cv2.cvtColor(frame_rgba, cv2.COLOR_RGBA2BGR)
-    win_name = 'ROI Selection -- draw box then SPACE/ENTER'
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.resizeWindow(win_name, 960, 720)
-    cv2.putText(disp, 'Draw ROI + SPACE/ENTER.  C = cancel.',
-                (20, 40), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1.2, (0, 200, 0), 2)
-    # Lesson 9: imshow before selectROI to fully initialise the Qt window
-    cv2.imshow(win_name, disp)
-    cv2.waitKey(1)
-
-    roi = cv2.selectROI(win_name, disp, fromCenter=False)
-    x, y, w, h = [int(v) for v in roi]
-    cv2.destroyWindow(win_name)
-    cv2.waitKey(1)
-
-    if w > 0 and h > 0:
-        return [x, y, w, h]
-    return None
+# GUI selection logic moved to app_utils.py
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +218,7 @@ def tracker_probe(pad, info, state):
                          x, y, w, h)
                 
                 # Phase 6.5: Optimize PGIE (one-shot mode)
-                if state.pgie_element:
+                if state.pgie_element and state.pgie_one_shot:
                     log.info('PGIE optimization: Setting interval to 10000 for power-save.')
                     state.pgie_element.set_property('interval', 10000)
 
@@ -394,18 +268,19 @@ def tracker_probe(pad, info, state):
                     return Gst.PadProbeReturn.DROP
                 
                 # Phase 6.4: Clear detections for frame 0 too!
-                while frame_meta.obj_meta_list is not None:
-                    try:
-                        obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
-                        pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
-                    except Exception:
-                        break
-                while frame_meta.display_meta_list is not None:
-                    try:
-                        disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
-                        pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
-                    except Exception:
-                        break
+                if state.pgie_one_shot:
+                    while frame_meta.obj_meta_list is not None:
+                        try:
+                            obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
+                            pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+                        except Exception:
+                            break
+                    while frame_meta.display_meta_list is not None:
+                        try:
+                            disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
+                            pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
+                        except Exception:
+                            break
 
             else:
                 log.error('Headless mode requires static_roi or --init_bbox.')
@@ -422,20 +297,20 @@ def tracker_probe(pad, info, state):
         if state.initialized:
             # Phase 6.4: Clear PGIE artifacts (boxes, labels, display meta).
             # Do this for EVERY frame after init (including frame 0 unblocking).
-            meta_list_to_clear = [frame_meta.obj_meta_list, frame_meta.display_meta_list]
-            while frame_meta.obj_meta_list is not None:
-                try:
-                    obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
-                    pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
-                except Exception:
-                    break
+            if state.pgie_one_shot:
+                while frame_meta.obj_meta_list is not None:
+                    try:
+                        obj_meta = pyds.NvDsObjectMeta.cast(frame_meta.obj_meta_list.data)
+                        pyds.nvds_remove_obj_meta_from_frame(frame_meta, obj_meta)
+                    except Exception:
+                        break
 
-            while frame_meta.display_meta_list is not None:
-                try:
-                    disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
-                    pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
-                except Exception:
-                    break
+                while frame_meta.display_meta_list is not None:
+                    try:
+                        disp_meta = pyds.NvDsDisplayMeta.cast(frame_meta.display_meta_list.data)
+                        pyds.nvds_remove_display_meta_from_frame(frame_meta, disp_meta)
+                    except Exception:
+                        break
 
         t0      = time.perf_counter()
         results = state.manager.update(frame_rgb, state.frame_idx)
@@ -693,28 +568,7 @@ def build_pipeline(state, pipe_cfg):
 # RTSP server
 # ---------------------------------------------------------------------------
 
-def setup_rtsp_server(rtsp_port, udp_port, mount_path='/sutrack'):
-    """
-    Create a GstRtspServer that wraps the udpsink output as an RTSP stream.
-    Clients connect to: rtsp://<jetson-ip>:<rtsp_port><mount_path>
-    """
-    if not RTSP_AVAILABLE:
-        return None
-
-    server  = GstRtspServer.RTSPServer.new()
-    server.props.service = str(rtsp_port)
-
-    factory = GstRtspServer.RTSPMediaFactory.new()
-    factory.set_launch(
-        '( udpsrc name=pay0 port=%d '
-        'caps="application/x-rtp,media=video,clock-rate=90000,'
-        'encoding-name=H264,payload=96" )' % udp_port
-    )
-    factory.set_shared(True)
-
-    server.get_mount_points().add_factory(mount_path, factory)
-    server.attach(None)
-    return server
+# RTSP server moved to app_utils.py
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +614,8 @@ def main():
                         help='Disable PGIE even if pgie_config is set in config.')
     parser.add_argument('--no-rtsp', action='store_true',
                         help='Disable RTSP streaming (useful for debugging).')
+    parser.add_argument('--no-one-shot', action='store_true',
+                        help='Disable PGIE power-save optimization (keep detector running).')
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
@@ -785,6 +641,8 @@ def main():
         pipe_cfg['headless'] = True
     if args.no_rtsp:
         pipe_cfg['rtsp_enabled'] = False
+    if args.no_one_shot:
+        pipe_cfg['pgie_one_shot'] = False
 
     headless = pipe_cfg.get('headless', False)
 
@@ -796,6 +654,7 @@ def main():
         pgie_config_rel = args.pgie_config
 
     pgie_enabled = bool(pgie_config_rel) and not headless and not args.no_pgie
+    log.info('PGIE enabled: %s (one-shot: %s)', pgie_enabled, pipe_cfg.get('pgie_one_shot', True))
 
     pgie_config_path = ''
     if pgie_enabled:
@@ -837,7 +696,8 @@ def main():
 
     state            = AppState(manager       = manager,
                                 cfg           = cfg,
-                                headless      = headless)
+                                headless      = headless,
+                                pgie_one_shot = pipe_cfg.get('pgie_one_shot', True))
     state.init_bbox  = args.init_bbox   # may be None
     state.pgie_enabled = pgie_enabled
     state.pgie_config_path = pgie_config_path
@@ -853,11 +713,7 @@ def main():
     if pipe_cfg.get('rtsp_enabled', True) and not args.no_rtsp:
         server = setup_rtsp_server(rtsp_port, udp_port, rtsp_path)
         if server:
-            import socket
-            try:
-                host = socket.gethostbyname(socket.gethostname())
-            except Exception:
-                host = '127.0.0.1'
+            host = get_local_ip()
             log.info('RTSP stream ready: rtsp://%s:%d%s', host, rtsp_port, rtsp_path)
             log.info('View with:  vlc rtsp://%s:%d%s', host, rtsp_port, rtsp_path)
 
@@ -915,7 +771,12 @@ def main():
             sys.exit(0)
 
         # Initialize tracker from the selected box (main thread -- safe)
-        x, y, w, h = selected_bbox
+        if isinstance(selected_bbox, dict):
+            x, y, w, h = selected_bbox['x'], selected_bbox['y'], selected_bbox['w'], selected_bbox['h']
+            # Optionally capture target_id if RTSP App state supports it (Phase 6 might not)
+        else:
+            x, y, w, h = selected_bbox
+        
         frame_rgb   = cv2.cvtColor(state.init_frame, cv2.COLOR_RGBA2RGB)
         state.manager.initialize(frame_rgb, [int(x), int(y), int(w), int(h)],
                                  frame_idx=0)
@@ -924,7 +785,7 @@ def main():
                  int(x), int(y), int(w), int(h))
 
         # Phase 6.5: Optimize PGIE (one-shot mode)
-        if state.pgie_element:
+        if state.pgie_element and state.pgie_one_shot:
             log.info('PGIE optimization: Setting interval to 10000 for power-save.')
             state.pgie_element.set_property('interval', 10000)
 

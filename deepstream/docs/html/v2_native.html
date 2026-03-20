@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PGIE Click-to-Select — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">🏠</span> Overview</a>
+    <a href="install.html"><span class="nav-icon">📦</span> Installation</a>
+    
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">🐢</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html" class="active"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">🎯</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">👥</span> Multi-Object Manager</a>
+  </nav>
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#pipeline-change"><span class="nav-icon">&#128295;</span> Pipeline Architecture</a>
+    <a href="#probe"><span class="nav-icon">&#128225;</span> Pad Probe Logic</a>
+    <a href="#rtsp"><span class="nav-icon">&#128246;</span> RTSP Streaming</a>
+    <a href="#what-is-pgie"><span class="nav-icon">&#10067;</span> What is PGIE?</a>
+    <a href="#thread-sync"><span class="nav-icon">&#128257;</span> Thread Synchronization</a>
+    <a href="#click-to-select"><span class="nav-icon">&#128433;</span> Click-to-Select Logic</a>
+    <a href="#optimization"><span class="nav-icon">&#9889;</span> GPU Optimization</a>
+    <a href="#filtering"><span class="nav-icon">&#128683;</span> Metadata Filtering</a>
+    <a href="#fallback"><span class="nav-icon">&#8595;</span> Fallback Chain</a>
+    <a href="#pgie-config"><span class="nav-icon">&#128196;</span> PGIE Config Reference</a>
+    <a href="#cli"><span class="nav-icon">&#9654;</span> CLI Usage</a>
+  </nav>
+</aside>
+
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#128433; apps/deepstream_rtsp_app.py</div>
+    <h1>V2: Native OSD &amp; RTSP</h1>
+    <p>
+      Phase 6 introduces a fully hardware-accelerated pipeline. It draws target boxes via <code>nvdsosd</code> in GPU memory and streams video via RTSP. It optionally includes a DeepStream object detector (PGIE) to let the user securely <strong>click on the object</strong> they want to track in a window showing the detector's suggestions.
+    </p>
+  </div>
+
+  <h2 id="what-is-pgie">What is PGIE?</h2>
+  <p>
+    In DeepStream, a <strong>Primary GIE (PGIE)</strong> is a <code>nvinfer</code> element
+    that runs an object detector inline in the GStreamer pipeline. It attaches detection
+    results directly to the frame buffer as <code>NvDsObjectMeta</code> records, which any
+    downstream element or pad probe can read.
+  </p>
+  <p>
+    Phase 6 uses the pre-built <strong>ResNet-10 INT8 detector</strong> that ships with
+    DeepStream SDK. It detects four classes (Car, Bicycle, Person, Roadsign) and produces
+    <code>NvDsObjectMeta</code> with <code>rect_params</code> (pixel bounding box),
+    <code>class_id</code>, <code>obj_label</code>, and <code>confidence</code>.
+  </p>
+
+  <table>
+    <thead><tr><th>Class ID</th><th>Label</th><th>Color in window</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>Car</td><td>Blue</td></tr>
+      <tr><td>1</td><td>Bicycle</td><td>Yellow</td></tr>
+      <tr><td>2</td><td>Person</td><td>Green</td></tr>
+      <tr><td>3</td><td>Roadsign</td><td>Red</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout info">
+    <div class="callout-title">Using a Custom Detector</div>
+    The PGIE element is fully configurable. To use a different detector (e.g., PeopleNet,
+    YOLOv8, or a custom model), replace the paths in <code>pgie_config.txt</code>:
+    <code>model-file</code>, <code>model-engine-file</code>, <code>labelfile-path</code>,
+    and update <code>num-detected-classes</code> and <code>output-blob-names</code>.
+    No Python code changes are required.
+  </div>
+
+  <h2 id="pipeline-change">Phase 6 Pipeline — NvDsOsd + RTSP + PGIE</h2>
+  <p>
+    The recommended V2 application is <code>deepstream_rtsp_app.py</code>. It uses a native
+    DeepStream pad probe instead of appsink, draws boxes via <code>nvdsosd</code> in GPU memory,
+    and streams output over RTSP using hardware H.264 encoding.
+  </p>
+
+  <div class="diagram"><span class="d-title">PHASE 6 PIPELINE (deepstream_rtsp_app.py)</span>
+
+  filesrc / v4l2src / uridecodebin
+       |
+  decodebin  (hardware nvv4l2decoder on Jetson)
+       |
+  nvvideoconvert  compute-hw=1       VIC: NVMM → NVMM RGBA (no EGL context)
+       |
+  nvstreammux  batch-size=1  width=1280  height=720
+       |
+  nvinfer  config-file-path=pgie_config.txt   [Phase 6: optional PGIE detector]
+       |    ResNet-10 INT8; writes NvDsObjectMeta detections into frame metadata
+       |
+  nvvideoconvert  compute-hw=1       bridge required between nvinfer → nvdsosd
+       |
+  nvdsosd  process-mode=0
+       |
+       | ← PAD PROBE fires on sink pad (Python tracker_probe callback):
+       |   - frame 0: capture RGBA frame + read PGIE detections from obj_meta_list
+       |              state.frame_ready.set()     signal main thread
+       |              state.init_done.wait()      block until ROI is selected
+       |   - frame 1+: cv.cvtColor RGBA→RGB
+       |               TrackerManager.update()
+       |               write NvDsObjectMeta bbox + label per tracked object
+       |
+       +──── queue ──── nvvideoconvert(hw=1) ──── nv3dsink   [local display]
+       |
+       └──── queue ──── nvvideoconvert(hw=1) ──── nvv4l2h264enc
+                                                        |
+                                                  rtph264pay
+                                                        |
+                                                  udpsink  port=5400
+
+  GstRtspServer  port=8554:
+      udpsrc(5400) → rtsp://&lt;jetson-ip&gt;:8554/sutrack</div>
+
+  <h2 id="probe">Pad Probe Logic — <code>tracker_probe()</code></h2>
+  <p>
+    The pad probe is attached to the <strong>sink pad of <code>nvdsosd</code></strong>.
+    It fires after <code>nvinfer</code> has already populated frame metadata, but before
+    <code>nvdsosd</code> renders the frame. This ordering ensures PGIE detections are
+    available when the probe reads them on frame 0.
+  </p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>First Frame — Capture &amp; Signal</h4>
+        <p>
+          On frame 0, the probe calls <code>pyds.get_nvds_buf_surface()</code> to get an RGBA
+          NumPy array, reads all <code>NvDsObjectMeta</code> entries from <code>obj_meta_list</code>
+          (populated by <code>nvinfer</code>), stores them in <code>state.first_frame_detections</code>,
+          and calls <code>state.frame_ready.set()</code> to wake the main thread.
+          Then it blocks on <code>state.init_done.wait()</code> until ROI selection is complete.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Main Thread — ROI Selection (while probe waits)</h4>
+        <p>
+          The main thread waits on <code>state.frame_ready.wait()</code>, then calls
+          <code>select_bbox_click_to_select()</code> or <code>manual_roi_select()</code>. 
+          All OpenCV GUI calls happen here — never
+          inside the probe (Lesson 25). Once a box is selected, <code>state.init_done.set()</code>
+          unblocks the probe.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Subsequent Frames — Track &amp; Draw</h4>
+        <p>
+          The probe converts the RGBA frame to RGB, calls <code>TrackerManager.update()</code>,
+          and for each returned bounding box acquires an <code>NvDsObjectMeta</code> from the pool,
+          fills <code>rect_params</code> and <code>text_params</code>, and adds it to the frame.
+          <code>nvdsosd</code> then renders these boxes in GPU memory before the tee.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <h2 id="rtsp">RTSP Streaming</h2>
+  <p>
+    After <code>nvdsosd</code>, a <code>tee</code> element splits the stream into two branches.
+    The RTSP branch encodes with <code>nvv4l2h264enc</code> (Jetson NVENC hardware block) and
+    sends RTP packets to a <code>udpsink</code> on port 5400. A <code>GstRtspServer</code>
+    instance wraps a <code>udpsrc</code> media factory and serves the combined stream at
+    <code>rtsp://&lt;jetson-ip&gt;:8554/sutrack</code>.
+  </p>
+  <p>
+    The display branch tries <code>nv3dsink</code> (Jetson-native, no EGL copy) first, falling
+    back to <code>nveglglessink</code> with a <code>nvvideoconvert(compute-hw=1)</code> bridge
+    to avoid the NVMM surface array crash (Lesson 24).
+  </p>
+
+  <div class="callout info">
+    <div class="callout-title">Headless / SSH Mode</div>
+    Set <code>pipeline.headless: true</code> in <code>tracker_config.yml</code>.
+    The display branch connects to <code>fakesink</code> instead of <code>nv3dsink</code>.
+    No <code>DISPLAY</code> environment variable is needed. All output goes to the RTSP stream.
+    Combine with <code>tracker.static_roi</code> for fully unattended operation.
+  </div>
+
+  <h2 id="optimization">One-Shot GPU Optimization (Power-Save)</h2>
+  <p>
+    Running an object detector on every frame is expensive. To maximize performance, Phase 6.5
+    implements a <strong>"One-Shot" detection flow</strong>:
+  </p>
+  <ul>
+    <li><strong>Frame 0:</strong> Detector runs with <code>interval=0</code> to provide ROI candidates.</li>
+    <li><strong>Selection:</strong> User clicks an object, the tracker initializes.</li>
+    <li><strong>Optimization:</strong> If <code>state.pgie_one_shot</code> is true (default), the application dynamically sets the PGIE <code>interval</code>
+    property to <strong>10,000 frames</strong>.</li>
+  </ul>
+  <p>
+    Use <code>--no-one-shot</code> to keep the detector running in the background.
+  </p>
+  <p>
+    This effectively puts the detector to sleep immediately after it completes its task,
+    freeing 100% of the GPU inference cycles for the SUTrack model.
+  </p>
+
+  <h2 id="filtering">Metadata Filtering (Clean Output)</h2>
+  <p>
+    Even if the detector is "sleeping", its initial detections on Frame 0 might persist,
+    or it might fire occasionally. To ensure a professional, distraction-free output,
+    the <code>tracker_probe</code> aggressively <strong>strips all detector metadata</strong>
+    once tracking starts.
+  </p>
+  <div class="callout warning">
+    <div class="callout-title">Lesson 27 — Explicit Metadata Removal</div>
+    Simply ignoring detector boxes in Python isn't enough. The <code>nvdsosd</code>
+    element draws every box it finds in <code>obj_meta_list</code>. The probe must
+    explicitly call <code>pyds.nvds_remove_obj_meta_from_frame()</code> for every
+    frame to keep the stream clean.
+  </div>
+
+  <h2 id="thread-sync">Thread Synchronization — Why It Matters</h2>
+  <p>
+    GStreamer runs the pad probe in a <strong>streaming thread</strong>. OpenCV GUI functions
+    (<code>namedWindow</code>, <code>imshow</code>, <code>waitKey</code>,
+    <code>setMouseCallback</code>) must only be called from the <strong>Python main thread</strong>.
+    Calling them from the probe causes a segfault or a silent hang on Jetson.
+  </p>
+  <p>
+    Phase 6 uses two <code>threading.Event</code> objects to bridge the threads safely:
+  </p>
+
+  <div class="diagram"><span class="d-title">THREADING.EVENT SYNCHRONIZATION (Lessons 25, 26)</span>
+
+  GStreamer streaming thread         Python main thread
+  (tracker_probe callback)           (main() function)
+  ─────────────────────────          ──────────────────────────────
+  pipeline starts playing     -->    loop.run() is blocked normally
+
+  frame 0 arrives:
+    read RGBA frame
+    read PGIE detections
+    state.frame_ready.set()    -->    main thread unblocks
+    state.init_done.wait()            select_bbox_click_to_select()
+       [streaming BLOCKED]               or manual_roi_select()
+                                      manager.initialize(frame_rgb, bbox)
+                              &lt;--    state.init_done.set()
+  probe unblocks
+  return Gst.PadProbeReturn.OK
+  ─────────────────────────
+  frame 1, 2, 3 ... → normal tracking loop</div>
+
+  <div class="callout rule">
+    <div class="callout-title">Lesson 25 — OpenCV GUI in Main Thread Only</div>
+    All <code>cv2</code> window/display calls must be in <code>main()</code>, never in
+    <code>tracker_probe()</code>. The probe runs in GStreamer's internal streaming thread.
+    Qt requires GUI calls on the OS main thread.
+  </div>
+  <div class="callout rule">
+    <div class="callout-title">Lesson 26 — threading.Event for Probe / GUI Sync</div>
+    Use <code>state.frame_ready.set()</code> in the probe to signal the main thread, and
+    <code>state.init_done.wait()</code> to block the probe until the user completes ROI
+    selection. This keeps the streaming thread paused at exactly frame 0 with no busy-wait.
+  </div>
+
+  <h2 id="click-to-select">Click-to-Select Logic — <code>select_bbox_click_to_select()</code></h2>
+  <p>
+    This function is called by <code>main()</code> after the probe signals frame 0 is ready
+    and PGIE has provided detections.
+  </p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Draw Detection Boxes</h4>
+        <p>
+          The first frame (RGBA) is converted to BGR. Each detection from
+          <code>state.first_frame_detections</code> is drawn as a coloured rectangle with the
+          class label and confidence score. A text prompt — <em>"CLICK object to track.
+          Q/ESC = manual ROI"</em> — is overlaid at the top.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Open Window and Register Mouse Callback</h4>
+        <p>
+          <code>cv2.namedWindow()</code> + <code>cv2.imshow()</code> open the window.
+          <code>cv2.setMouseCallback()</code> registers <code>on_click()</code>, which
+          checks all detections when a left button press occurs.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Click Point to Bounding Box</h4>
+        <p>
+          For a click at pixel <code>(px, py)</code>, the code checks every detection box
+          <code>(dx, dy, dw, dh)</code>. A box contains the click if
+          <code>dx &lt;= px &lt;= dx+dw</code> and <code>dy &lt;= py &lt;= dy+dh</code>.
+          If multiple boxes overlap, the one with the <strong>smallest area</strong>
+          (<code>dw * dh</code>) wins — this selects the innermost box and avoids
+          accidentally targeting a large background detection.
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>Return Selected Box or None</h4>
+        <p>
+          If a valid box is clicked, the window closes and returns <code>[x, y, w, h]</code>.
+          Pressing Q or ESC returns <code>None</code>, which triggers the manual ROI fallback.
+          The window stays open if the click was outside all detection boxes — the user
+          can try again.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <pre><code><span class="kw">def</span> <span class="fn">select_bbox_click_to_select</span>(frame_rgba, detections):
+    frame_bgr = cv2.<span class="fn">cvtColor</span>(frame_rgba, cv2.COLOR_RGBA2BGR)
+
+    <span class="cm"># Draw per-class coloured boxes + confidence labels</span>
+    <span class="kw">for</span> det <span class="kw">in</span> detections:
+        x, y, w, h = det[<span class="st">'x'</span>], det[<span class="st">'y'</span>], det[<span class="st">'w'</span>], det[<span class="st">'h'</span>]
+        color = _CLASS_COLORS[det[<span class="st">'class_id'</span>] % <span class="fn">len</span>(_CLASS_COLORS)]
+        cv2.<span class="fn">rectangle</span>(frame_bgr, (x, y), (x+w, y+h), color, <span class="nu">2</span>)
+        cv2.<span class="fn">putText</span>(frame_bgr, <span class="st">'%s %.2f'</span> % (det[<span class="st">'label'</span>], det[<span class="st">'confidence'</span>]),
+                    (x, <span class="fn">max</span>(y-<span class="nu">4</span>, <span class="nu">12</span>)), cv2.FONT_HERSHEY_SIMPLEX, <span class="nu">0.55</span>, color, <span class="nu">1</span>)
+
+    cv2.<span class="fn">putText</span>(frame_bgr, <span class="st">'CLICK object to track.  Q/ESC = manual ROI.'</span>,
+                (<span class="nu">10</span>, <span class="nu">30</span>), cv2.FONT_HERSHEY_SIMPLEX, <span class="nu">0.75</span>, (<span class="nu">0</span>, <span class="nu">220</span>, <span class="nu">255</span>), <span class="nu">2</span>)
+
+    win_name = <span class="st">'Click-to-Select Object'</span>
+    cv2.<span class="fn">namedWindow</span>(win_name, cv2.WINDOW_AUTOSIZE)
+    cv2.<span class="fn">imshow</span>(win_name, frame_bgr)
+
+    result = {<span class="st">'selected'</span>: <span class="kw">None</span>, <span class="st">'done'</span>: <span class="kw">False</span>}
+
+    <span class="kw">def</span> <span class="fn">on_click</span>(event, cx, cy, flags, param):
+        <span class="kw">if</span> event != cv2.EVENT_LBUTTONDOWN:
+            <span class="kw">return</span>
+        best, best_area = <span class="kw">None</span>, <span class="fn">float</span>(<span class="st">'inf'</span>)
+        <span class="kw">for</span> det <span class="kw">in</span> detections:
+            dx, dy, dw, dh = det[<span class="st">'x'</span>], det[<span class="st">'y'</span>], det[<span class="st">'w'</span>], det[<span class="st">'h'</span>]
+            <span class="kw">if</span> dx &lt;= cx &lt;= dx+dw <span class="kw">and</span> dy &lt;= cy &lt;= dy+dh:
+                area = dw * dh
+                <span class="kw">if</span> area &lt; best_area:
+                    best_area, best = area, [dx, dy, dw, dh]
+        <span class="kw">if</span> best <span class="kw">is not None</span>:
+            param[<span class="st">'selected'</span>] = best
+            param[<span class="st">'done'</span>]     = <span class="kw">True</span>
+
+    cv2.<span class="fn">setMouseCallback</span>(win_name, on_click, result)
+
+    <span class="kw">while not</span> result[<span class="st">'done'</span>]:
+        key = cv2.<span class="fn">waitKey</span>(<span class="nu">50</span>) &amp; <span class="nu">0xFF</span>
+        <span class="kw">if</span> key == <span class="fn">ord</span>(<span class="st">'q'</span>) <span class="kw">or</span> key == <span class="nu">27</span>:   <span class="cm"># Q or ESC</span>
+            <span class="kw">break</span>
+
+    cv2.<span class="fn">destroyWindow</span>(win_name)
+    cv2.<span class="fn">waitKey</span>(<span class="nu">1</span>)
+    <span class="kw">return</span> result[<span class="st">'selected'</span>]   <span class="cm"># None if cancelled</span></code></pre>
+
+  <h2 id="fallback">Three-Tier Fallback Chain</h2>
+  <p>
+    The ROI selection logic in <code>main()</code> always falls back gracefully, so the
+    application never crashes regardless of the environment.
+  </p>
+
+  <div class="diagram"><span class="d-title">ROI SELECTION FALLBACK CHAIN</span>
+
+  Is static_roi set in config (or --init_bbox on CLI)?
+        YES  -->  Use it directly. No window opened. (headless / SSH safe)
+        |
+        NO
+        |
+  Is PGIE enabled AND nvinfer produced detections on frame 0?
+        YES  -->  Open "Click-to-Select Object" window.
+        |         User clicks a detection box.
+        |         Box returned --> initialize tracker.
+        |         User presses Q/ESC --> falls through to manual.
+        |
+        NO (--no-pgie, or detections=0, or user pressed ESC)
+        |
+        v
+  Open manual selectROI window.
+  User draws a rectangle, presses SPACE/ENTER.
+  Box returned --> initialize tracker.
+  User presses ESC --> app exits gracefully.</div>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Static ROI — Fully Headless</h4>
+        <p>Set <code>tracker.static_roi: "X,Y,W,H"</code> in YAML or pass <code>--init_bbox X Y W H</code>.
+        No display needed. Ideal for automated pipelines and SSH.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>PGIE Click-to-Select — One Click</h4>
+        <p>Requires a display (<code>export DISPLAY=:0</code>). The detector provides perfectly
+        aligned boxes — no need to draw freehand. One click starts tracking.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Manual selectROI — Draw a Box</h4>
+        <p>Fallback for any situation where PGIE is off or no detections appear. Classic mouse-drag
+        interface. <code>imshow()</code> is called before <code>selectROI()</code> to initialize
+        the Qt window handler (Lesson 9).</p>
+      </div>
+    </div>
+  </div>
+
+  <h2 id="pgie-config">PGIE Configuration File — <code>configs/pgie_config.txt</code></h2>
+  <p>
+    This is a standard DeepStream <code>nvinfer</code> config file. The pre-built ResNet-10
+    INT8 engine ships with JetPack at the path shown below.
+  </p>
+
+  <pre><code>[property]
+gpu-id=0
+
+net-scale-factor=0.0039215697906911373   <span class="cm"># 1/255 normalization</span>
+model-color-format=0                     <span class="cm"># BGR input</span>
+model-file=... resnet10.caffemodel
+proto-file=... resnet10.prototxt
+model-engine-file=... resnet10.caffemodel_b1_gpu0_int8.engine
+labelfile-path=... labels.txt
+int8-calib-file=... cal_trt.bin
+output-blob-names=conv2d_bbox;conv2d_cov/Sigmoid
+
+batch-size=1
+process-mode=1                           <span class="cm"># primary detector</span>
+network-mode=1                           <span class="cm"># INT8</span>
+num-detected-classes=4
+interval=0                               <span class="cm"># run every frame</span>
+gie-unique-id=1
+network-type=0                           <span class="cm"># detector (not classifier)</span>
+cluster-mode=2                           <span class="cm"># DBSCAN</span>
+force-implicit-batch-dim=1
+
+[class-attrs-all]
+topk=20
+nms-iou-threshold=0.5
+pre-cluster-threshold=0.2</code></pre>
+
+  <table>
+    <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>model-engine-file</code></td><td>Pre-compiled TRT INT8 engine for ResNet-10 (batch=1). Ships with DeepStream SDK — no compilation needed.</td></tr>
+      <tr><td><code>network-mode=1</code></td><td>INT8 quantized inference — fast on Jetson DLA/GPU without GPU memory penalty.</td></tr>
+      <tr><td><code>interval=0</code></td><td>Run detection every frame. Can be increased (e.g., <code>interval=5</code>) once tracking is active to save GPU cycles.</td></tr>
+      <tr><td><code>cluster-mode=2</code></td><td>DBSCAN clustering for bounding box post-processing (matches DS sample defaults).</td></tr>
+      <tr><td><code>pre-cluster-threshold</code></td><td>Minimum confidence before NMS. Lowering detects more objects but also more false positives.</td></tr>
+      <tr><td><code>output-blob-names</code></td><td>Specific to ResNet-10 Caffe architecture. Must match if you replace the model.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <div class="callout-title">Engine File Location (JetPack 5.x)</div>
+    <pre><code>/opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/
+    resnet10.caffemodel_b1_gpu0_int8.engine</code></pre>
+    Verify it exists before running: if it is missing, re-install the DeepStream SDK samples
+    or run <code>deepstream-app</code> once to trigger engine generation.
+  </div>
+
+  <h2 id="cli">CLI Usage</h2>
+
+  <table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>--pgie-config PATH</code></td>
+        <td>str</td>
+        <td>Override the <code>pgie_config</code> path from YAML. Use an absolute path or a path relative to the working directory.</td>
+      </tr>
+      <tr>
+        <td><code>--no-pgie</code></td>
+        <td>flag</td>
+        <td>Disable PGIE for this run regardless of <code>tracker_config.yml</code>. The pipeline skips <code>nvinfer</code> and goes straight to manual ROI selection.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <pre><code><span class="cm"># Standard run — PGIE click-to-select (config enables PGIE)</span>
+<span class="kw">export</span> DISPLAY=:0
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4
+
+<span class="cm"># Disable PGIE at runtime, fall through to manual draw-a-box</span>
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --no-pgie
+
+<span class="cm"># Custom PGIE config (e.g., PeopleNet model)</span>
+python deepstream/apps/deepstream_rtsp_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --pgie-config /opt/nvidia/deepstream/deepstream/samples/configs/tlt_pretrained_models/config_infer_primary_peoplenet.txt</code></pre>
+
+  <div class="callout tip">
+    <div class="callout-title">Headless / SSH with static_roi</div>
+    When running over SSH without a display, always provide a static ROI so the app never
+    attempts to open a GUI window:
+    <pre><code><span class="cm"># In tracker_config.yml:</span>
+tracker:
+  static_roi: "300,200,120,180"   <span class="cm"># X,Y,W,H</span></code></pre>
+    With <code>static_roi</code> set, neither PGIE click-to-select nor manual draw-a-box is
+    triggered — the pipeline initializes automatically on the first frame.
+  </div>
+
+  <div class="page-footer">
+    <div class="nav-links"><a href="multi-object.html">&#8592; Multi-Object Manager</a></div>
+    <div class="nav-links"><a href="index.html">Back to Overview &#8594;</a></div>
+  </div>
+
+</main>
+</body>
+</html>

@@ -464,3 +464,107 @@ while frame_meta.display_meta_list:
 ```
 
 **Rule:** When stripping metadata for a clean output, always check and clear both `obj_meta_list` and `display_meta_list`.
+
+---
+
+## Lesson 30 — Center-distance is more robust than IOU for drift detection
+
+**Context:** Detecting when SUTrack drifts onto a distractor in a crowded scene.
+
+**Problem:** In overlapping crowds, IOU can remain high even if the tracker has switched from the target's chest to a distractor's shoulder.
+
+**Root cause:** IOU measures area overlap, but not alignment.
+
+**Fix:** Implement a center-distance guard. Calculate the Euclidean distance between the SUTrack box center and the Native (NvDCF) leader center. If the distance exceeds a percentage of the box width (e.g., 15-25%), trigger a re-sync.
+
+**Rule:** Use geometric center-distance as a primary "Drift Guard" in hybrid tracking scenarios.
+
+---
+
+## Lesson 31 — Native tracker "Leader Poisoning" in Hybrid Mode
+
+**Context:** Re-syncing SUTrack to the NvDCF bounding box when drift is detected.
+
+**Problem:** If the Native tracker (NvDCF) ITSELF drifts onto a distractor, it "drags" a healthy SUTrack along with it.
+
+**Root cause:** Blindly trusting the Native leader as the ground truth.
+
+**Fix:** Implement "Skeptical Hybrid" logic. Only trigger a re-sync if SUTrack's internal confidence is also low (< 0.2). If SUTrack is confident but far from the leader, it might actually be correct while the leader is drifting.
+
+**Rule:** Never allow an external tracker to force a re-sync on a high-confidence tracker.
+
+---
+
+## Lesson 32 — NvDsDisplayMeta is required for "Forced" debug overlays
+
+**Context:** Implementing `--debug-boxes` to see raw tracker states.
+
+**Problem:** Raw boxes added via `NvDsObjectMeta` would disappear because downstream components or UI logic were filtering objects by `class_id` or `unique_component_id`.
+
+**Root cause:** `obj_meta` is part of the inference stream and is subject to filtering/aggregation logic.
+
+**Fix:** Use `NvDsDisplayMeta` for raw debug visualization. Items in DisplayMeta (lines, rects, text) are "passive" overlays that are drawn directly by OSD and are not filtered as "objects".
+
+**Rule:** Use `DisplayMeta` for internal debug visualization to ensure standard object-filtering logic doesn't hide your debug data.
+
+---
+
+## Lesson 33 — DeepStream OSD requires has_bg_color to be explicitly zeroed
+
+**Context:** Drawing raw rectangles using `NvDsDisplayMeta`.
+
+**Problem:** Debug boxes appeared as solid colored blocks instead of hollow rectangles.
+
+**Root cause:** The `has_bg_color` field in `NvDsRectParams` (inside DisplayMeta) defaults to a non-zero value or uninitialized garbage, causing the OSD to fill the rectangle.
+
+**Fix:** Explicitly set `r_meta.has_bg_color = 0` for every debug rectangle.
+
+**Rule:** Always explicitly initialize `has_bg_color` and `border_width` for every rectangle in `DisplayMeta`.
+
+---
+
+## Lesson 34 — TRT inference inside a GStreamer pad probe blocks the entire pipeline
+
+**Context:** `deepstream_desktop_app.py` (Phase 10 desktop app) — FPS dropped from 60 to 20-24 when entering LOCKED state.
+
+**Mistake:** Called `manager.update()` (SUTrack TRT inference, ~30 ms) directly inside the GStreamer pad probe callback.
+
+**Root cause:** A GStreamer pad probe runs on the streaming thread. Any blocking work inside the probe stalls the entire pipeline until it returns. With TRT inference taking ~30 ms per frame, the pipeline was capped at ~33 FPS maximum, and additional work (frame copy, histogram) pushed it to 20-24 FPS.
+
+The pattern looks innocent:
+```python
+def tracker_probe(pad, info, state):
+    ...
+    results = state.manager.update(rgb, frame_idx)  # BLOCKS for ~30 ms
+    ...
+    return Gst.PadProbeReturn.OK  # pipeline resumes here
+```
+
+**Fix:** Move all `manager` operations into a dedicated `TRTWorkerThread`. The probe:
+1. Copies the frame reference into the worker's pending slot (< 0.1 ms)
+2. Signals the worker thread
+3. Reads the *last computed result* for OSD rendering
+4. Returns immediately
+
+The worker thread processes frames at TRT speed (~30 FPS) while the GStreamer pipeline runs at source rate (60 FPS). OSD shows 1-2 frame lag on the bbox — imperceptible.
+
+```python
+class TRTWorkerThread(threading.Thread):
+    def submit_track(self, rgb, frame_idx):
+        with self._lock:
+            self._pending = ('track', rgb, frame_idx)  # overwrite if busy
+        self._trigger.set()
+
+# In probe:
+state.trt_worker.submit_track(rgb, state.frame_idx)  # non-blocking
+results = state.trt_worker.last_result               # last known bbox
+```
+
+Additional gains from the same fix:
+- Throttle `id_history.update()` to every 20 frames (histogram every frame was ~3 ms/frame wasted)
+- Throttle `GLib.idle_add` to every 5 frames (label updates at 12 Hz is sufficient)
+- Use `rgba[:, :, :3]` slice instead of `cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)` (avoids one full-frame allocation)
+
+**Result:** Pipeline FPS in LOCKED mode: 20-24 FPS → ~55-60 FPS. TRT inference rate unchanged (~28-33 FPS, hardware-limited).
+
+**Rule:** Never run TRT inference (or any operation > 2 ms) directly inside a GStreamer pad probe. Use a worker thread with a pending-slot double-buffer pattern. The probe submits work and reads the last result immediately.

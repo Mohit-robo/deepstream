@@ -20,27 +20,19 @@
 
   <div class="sidebar-section">Navigation</div>
   <nav>
-    <a href="index.html">
-      <span class="nav-icon">🏠</span> Overview
-    </a>
-    <a href="install.html" class="active">
-      <span class="nav-icon">📦</span> Installation
-    </a>
-    <a href="pipeline.html">
-      <span class="nav-icon">🎬</span> GStreamer Pipeline
-    </a>
-    <a href="engine.html">
-      <span class="nav-icon">⚡</span> TensorRT Engine
-    </a>
-    <a href="tracker-logic.html">
-      <span class="nav-icon">🎯</span> Tracker Logic
-    </a>
-    <a href="multi-object.html">
-      <span class="nav-icon">👥</span> Multi-Object Manager
-    </a>
-    <a href="pgie.html">
-      <span class="nav-icon">🖱️</span> PGIE Click-to-Select
-    </a>
+    <a href="index.html"><span class="nav-icon">🏠</span> Overview</a>
+    <a href="install.html" class="active"><span class="nav-icon">📦</span> Installation</a>
+    
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">🐢</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">🎯</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">👥</span> Multi-Object Manager</a>
   </nav>
 
   <div class="sidebar-section">On This Page</div>
@@ -432,7 +424,7 @@ EOF</code></pre>
       <div class="card-title">🚀 Quick Start</div>
       <div class="card-body">Build engine and run the Phase 6 app in 3 commands.</div>
     </a>
-    <a href="pipeline.html" class="card" style="text-decoration:none">
+    <a href="v1_legacy.html" class="card" style="text-decoration:none">
       <div class="card-title">🎬 Pipeline Internals</div>
       <div class="card-body">How the GStreamer pipeline is constructed and how the pad probe works.</div>
     </a>

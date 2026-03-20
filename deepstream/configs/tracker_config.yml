@@ -15,6 +15,11 @@ tracker:
   min_confidence: 0.25       # minimum detector confidence to spawn a new tracker
   iou_match_threshold: 0.3   # minimum IoU to match a detection to an existing track
   static_roi: ""             # Optional: "X,Y,W,H" to skip manual selection (e.g., "300,200,100,100")
+
+  # --- Phase 10: auto-hibernation (deepstream_nvtracker_v3.py) ---
+  # Number of consecutive low-confidence frames before entering STALE state.
+  # Increase for longer occlusion tolerance; decrease for faster cleanup.
+  hibernate_after: 150
   # static_roi: "201, 294, 116, 288"             # Optional: "X,Y,W,H" to skip manual selection (e.g., "300,200,100,100")
 
 pipeline:
@@ -40,3 +45,11 @@ pipeline:
   # When set (and not headless), nvinfer runs on frame 0, shows detected boxes,
   # and the user clicks one to initialize the tracker.
   pgie_config: configs/pgie_config.txt
+  pgie_one_shot: false        # If true, detector freezes after selection to save power.
+
+  # --- Phase 7: nvtracker (NvDCF multi-object tracker) ---
+  # NvDCF low-level algorithm config (passed to nvtracker ll-config-file property).
+  # Path relative to deepstream/ directory.
+  nvdcf_config: configs/nvdcf_config.txt
+  nvtracker_width: 640       # tracker processing width  (should be <= pipeline width)
+  nvtracker_height: 384      # tracker processing height (should be <= pipeline height)

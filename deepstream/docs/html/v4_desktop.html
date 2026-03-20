@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V4: GTK Desktop App — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">🏠</span> Overview</a>
+    <a href="install.html"><span class="nav-icon">📦</span> Installation</a>
+    
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">🐢</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html" class="active"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">🎯</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">👥</span> Multi-Object Manager</a>
+  </nav>
+
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#desktop-app"><span class="nav-icon">&#128187;</span> Desktop App</a>
+    <a href="#fps-optimization"><span class="nav-icon">&#9889;</span> FPS Optimization</a>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ CONTENT -->
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#128187; Phase 11 — apps/deepstream_desktop_app.py</div>
+    <h1>V4: GTK Desktop App</h1>
+    <p>
+      Phase 11 (V4) wraps the tracking pipeline inside a native Linux GTK3 application. It introduces GUI control buttons and unlocks full hardware FPS during tracking via a decoupled asynchronous TensorRT worker thread.
+    </p>
+  </div>
+
+  <!-- ── Phase 11 ───────────────────────────────────────── -->
+  <h2 id="desktop-app">GTK3 Desktop App</h2>
+
+  <p>
+    Phase 11 wraps the Phase 10 pipeline inside a GTK3 window with an embedded hardware video
+    canvas and control buttons. The GPU renders directly into the GTK drawing area via
+    <code>nv3dsink.set_window_handle(xid)</code> — no CPU frame copy for display.
+  </p>
+
+  <div class="diagram"><span class="d-title">DESKTOP APP LAYOUT</span>
+
+  +------------------------------------------+
+  |        Hardware Video (nv3dsink)          |
+  |        [OSD overlays render here]         |
+  +------------------------------------------+
+  |  FPS: 58.2  |  State: LOCKED             |
+  +------------------------------------------+
+  | [Select] [Prev] [Next] [Lock] [Cancel]   |
+  +------------------------------------------+</div>
+
+  <table>
+    <thead>
+      <tr><th>Button</th><th>Keyboard</th><th>Action</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>Select</strong></td><td><code>s</code></td><td>Enter SELECTING mode — OSD highlights the first detected object</td></tr>
+      <tr><td><strong>Prev</strong></td><td><code>p</code></td><td>Cycle candidate selection left</td></tr>
+      <tr><td><strong>Next</strong></td><td><code>n</code></td><td>Cycle candidate selection right</td></tr>
+      <tr><td><strong>Lock</strong></td><td><code>l</code> / Enter</td><td>Initialize SUTrack on highlighted object &rarr; LOCKED</td></tr>
+      <tr><td><strong>Cancel</strong></td><td><code>q</code> / Esc</td><td>Stop tracking &rarr; IDLE</td></tr>
+      <tr><td><em>Window close</em></td><td><code>x</code></td><td>Exit application</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── FPS Optimization ───────────────────────────────── -->
+  <h2 id="fps-optimization">FPS Optimization: <code>TRTWorkerThread</code></h2>
+
+  <h3>Root Cause: Probe Blocking the GStreamer Streaming Thread</h3>
+
+  <p>
+    In Phase 10, <code>manager.update()</code> (SUTrack TRT inference, ~30&thinsp;ms on Jetson) ran
+    directly inside the GStreamer pad probe. A pad probe runs on the streaming thread — any blocking
+    work inside it stalls the entire pipeline until the probe returns.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>State</th><th><code>get_rgb()</code></th><th>TRT (blocking)</th><th>Histogram</th><th>Probe time</th><th>Max FPS</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>IDLE</td><td>No</td><td>No</td><td>No</td><td>&lt; 1 ms</td><td>60 FPS</td>
+      </tr>
+      <tr>
+        <td>LOCKED (before fix)</td><td>Yes (~3 ms)</td><td>Yes (~30 ms)</td><td>Yes (~3 ms)</td><td>~36 ms</td><td>~27 FPS</td>
+      </tr>
+      <tr>
+        <td>LOCKED (after fix)</td><td>Yes (~3 ms)</td><td>Async (worker)</td><td>Every 20 frames</td><td>~4 ms</td><td>~60 FPS</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Solution: <code>TRTWorkerThread</code></h3>
+
+  <p>
+    All <code>manager</code> mutations (<code>initialize</code>, <code>update</code>, <code>clear</code>)
+    run exclusively in <code>TRTWorkerThread</code>. The probe submits frames non-blocking via a
+    pending-slot double-buffer and reads the last result for OSD.
+  </p>
+
+  <div class="diagram"><span class="d-title">ASYNC TRT WORKER FLOW</span>
+
+  GStreamer probe (every frame):          TRTWorkerThread (daemon):
+    get_rgb()             (~3 ms)           wait for trigger
+    submit_track(rgb)     (&lt;0.1 ms) -----&gt; preprocess + TRT infer (~30 ms)
+    read last_result      (GIL-safe)        store last_result
+    write OSD box         (~1 ms)    &lt;----- (probe reads on next call)
+    return OK             (total ~4 ms)
+
+  If worker is still busy when the next frame arrives,
+  the pending slot is overwritten -- always the freshest frame wins.</div>
+
+  <div class="callout note">
+    <div class="callout-title">1-2 frame OSD lag is imperceptible</div>
+    The displayed bbox reflects TRT results from 1-2 frames ago. At 60 FPS this is 16-33 ms of
+    positional lag. For a human walking at normal speed, the bbox moves &lt; 2 pixels in that time.
+    The visual difference is undetectable.
+  </div>
+
+  <h3>Additional Optimizations</h3>
+
+  <table>
+    <thead>
+      <tr><th>Optimization</th><th>Change</th><th>Saving</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Throttle histogram update</td>
+        <td><code>id_history.update()</code> every 20 frames (<code>HIST_UPDATE_INTERVAL</code>)</td>
+        <td>~3 ms per 19 out of 20 frames saved</td>
+      </tr>
+      <tr>
+        <td>Throttle GTK label refresh</td>
+        <td><code>GLib.idle_add</code> every 5 frames (<code>UI_UPDATE_EVERY</code>)</td>
+        <td>Reduces GTK event queue pressure at 60 FPS</td>
+      </tr>
+      <tr>
+        <td>RGBA&rarr;RGB without copy</td>
+        <td><code>rgba[:, :, :3]</code> slice instead of <code>cv2.cvtColor(rgba, RGBA2RGB)</code></td>
+        <td>Avoids one full-frame allocation (~2.8 MB) per LOCKED frame</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Thread Safety</h3>
+  <ul>
+    <li><code>_lock</code> protects <code>_pending</code> (written by probe, read by worker)</li>
+    <li><code>last_result</code> / <code>last_conf</code> replaced atomically — Python dict assignment is GIL-safe; probe reads without holding any lock</li>
+    <li>All <code>manager</code> calls go through the worker — <code>TrackerInstance.state</code> is never written from two threads simultaneously</li>
+    <li>Button handlers call <code>trt_worker.submit_init()</code> / <code>submit_clear()</code> — never touch <code>manager</code> directly</li>
+  </ul>
+
+  <div class="callout rule">
+    <div class="callout-title">Lesson 34: Never run TRT inference inside a GStreamer pad probe</div>
+    A pad probe runs on the GStreamer streaming thread. Any blocking operation (&gt; 2 ms) inside
+    the probe caps pipeline throughput to <code>1 / block_time</code> FPS. Use a worker thread with
+    a pending-slot double-buffer: submit the frame, return immediately, read the last result for OSD.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:2rem">
+    <a href="v2_native.html" class="card" style="text-decoration:none">
+      <div class="card-title">← PGIE Click-to-Select</div>
+      <div class="card-body">How Phase 6 uses a detector to suggest ROI candidates.</div>
+    </a>
+    <a href="multi-object.html" class="card" style="text-decoration:none">
+      <div class="card-title">Multi-Object Manager →</div>
+      <div class="card-body">TrackerManager lifecycle, IoU matching, and stale removal.</div>
+    </a>
+  </div>
+
+</main>
+</body>
+</html>
