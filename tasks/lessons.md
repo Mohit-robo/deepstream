@@ -616,3 +616,20 @@ os.environ['EGL_PLATFORM'] = 'surfaceless'
 This must be set **before** any GStreamer or DeepStream import (and before the `LD_PRELOAD` re-exec so the child process inherits it).
 
 **Rule:** For headless Jetson DeepStream deployments (SSH, Docker, CI), always set `EGL_PLATFORM=surfaceless` and remove any forwarded `DISPLAY`. Never rely on xdpyinfo to validate EGL usability — it tests X11 connectivity, not GPU device access.
+
+---
+
+## Lesson 37 — Extracting Bounding Boxes over the Network
+
+**Context:** The operator needs access to the raw tracking bounding box coordinates on the local machine for downstream programmatic use, without parsing the video stream.
+
+**Mistake:** Attempting to extract bounding box coordinates strictly from the drawn video stream or by modifying the RTSP metadata.
+
+**Root cause:** Injecting custom metadata into standard RTSP/H.264 streams requires complex SEI (Supplemental Enhancement Information) parsing that standard video clients cannot easily handle.
+
+**Fix:** Decouple the bounding box telemetry from the video stream entirely. 
+1. Use the existing Python `http.server` running on the Jetson to serve the `bbox` via a lightweight JSON endpoint (`GET /api/state`).
+2. Have the client poll this endpoint and dump the coordinates directly to `stdout` (e.g., `BBOX,<frame_idx>,<x>,<y>,<w>,<h>`).
+3. Pipe the client's output to grep or a script (`python v5_remote_client.py ... | grep "BBOX" > out.csv`).
+
+**Rule:** Always expose raw telemetry out-of-band (via REST/WebSockets) rather than trying to multiplex it into the video transport layer, and use `stdout` on the receiving end for easy piping to downstream logic.

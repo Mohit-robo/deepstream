@@ -138,6 +138,15 @@ python3 deepstream/apps/deepstream_server_app.py \
 python deepstream/apps/v5_remote_client.py --host 192.168.128.178
 ```
 
+**Bounding Box Extraction (Real-Time):**
+The server exposes the live tracking coordinates via the `GET /api/state` endpoint. The `v5_remote_client.py` automatically polls this and prints the bounding box to the terminal (`stdout`) in the format:
+`BBOX,<frame_idx>,<x>,<y>,<w>,<h>`
+
+You can easily pipe or redirect this output to save it on your local machine:
+```bash
+python deepstream/apps/v5_remote_client.py --host 192.168.128.178 | grep "BBOX" > tracking_results.csv
+```
+
 **Fully automatic (no operator interaction):**
 ```bash
 # Server: lock to the largest PGIE detection on the first frame automatically

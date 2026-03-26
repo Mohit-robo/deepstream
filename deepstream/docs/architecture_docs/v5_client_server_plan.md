@@ -33,6 +33,12 @@ The Jetson will run the complete V4 tracking logic with all performance optimiza
 *   **REST/Socket API:** A lightweight daemon thread using Python `http.server` or `Flask` will be bound to port `8000`. 
     *   `/api/state` (GET) → Exposes current TrackerState (LOCKED, IDLE, SEARCHING), FPS, and target tracking ID.
     *   `/api/command` (POST) → Ingests `{action: "..."}` payloads directly from the frontend to trigger internal `TrackerManager` states.
+**Key Design Decisions:**
+- **No ROI drawing**: The PGIE detector automatically finds objects every frame. The stream shows labeled boxes for all detections. The operator clicks on the desired target; the server resolves the click to the nearest detection centroid in the live frame — no manual bounding-box drawing at any point.
+- **EGL_PLATFORM=surfaceless**: `nvinfer` on Jetson requires EGL for NVMM buffer operations. In headless SSH sessions `DISPLAY=localhost:N` is an X11-forwarded socket that NVIDIA's libEGL cannot use. The server always sets `EGL_PLATFORM=surfaceless` (and drops any forwarded DISPLAY) to bind EGL directly to the GPU device.
+- **TCP RTSP transport**: `rtspsrc protocols=tcp` in the client forces RTP-over-TCP (interleaved on port 8554) so no random UDP ports need to be open in firewalls between Jetson and PC.
+- **Normalised click coordinates**: Client sends `{x: 0.0-1.0, y: 0.0-1.0}`. Server denormalises and finds the nearest live detection — compensates for ~0.5-1.5 s RTSP latency.
+- **Real-Time Bounding Box Sync**: The server exposes the active target's coordinates via `GET /api/state`. The client polls this and outputs `BBOX,idx,x,y,w,h` to stdout for programmatic consumption on the remote operator's machine.
 *   **Latency Compensation Strategy:** The most critical challenge. Given an RTSP network delay of ~0.5 - 1.5s, clicking on a moving bounding box frame locally acts on where the box *used to be*. 
     *   **Solution**: The client sends *normalized screen coordinates* `(x: float 0.0-1.0, y: float 0.0-1.0)`. The `deepstream_server_app` cross-references these static spatial coordinates with the active `nvtracker` metadata pool in its *current* live frame, calculating Euclidean distance and acquiring the structurally nearest valid candidate to lock on.
 

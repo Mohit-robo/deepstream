@@ -17,6 +17,10 @@ Controls:
     s = Select     n = Next      p = Prev
     l / Enter = Lock             q / Esc = Cancel      x = Quit
     Left-click on video = Click-to-lock nearest detection on the server
+
+Bounding Box Extraction:
+    The live tracking coordinates are printed directly to stdout as:
+    BBOX,<frame_idx>,<x>,<y>,<w>,<h>
 """
 
 import argparse
@@ -119,11 +123,15 @@ class SUTrackClient(Gtk.Window):
 
         self.fps_label   = Gtk.Label(label='FPS: --')
         self.state_label = Gtk.Label(label='State: --')
+        self.bbox_label  = Gtk.Label(label='BBox: --')
         self.fps_label.set_xalign(0)
         self.state_label.set_xalign(0)
+        self.bbox_label.set_xalign(0)
         info_bar.pack_start(self.fps_label,         False, False, 0)
         info_bar.pack_start(Gtk.Label(label=' | '), False, False, 0)
         info_bar.pack_start(self.state_label,       False, False, 0)
+        info_bar.pack_start(Gtk.Label(label=' | '), False, False, 0)
+        info_bar.pack_start(self.bbox_label,        False, False, 0)
 
         # Control buttons
         btn_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -408,6 +416,16 @@ class SUTrackClient(Gtk.Window):
         """Called on the GTK main thread via GLib.idle_add."""
         self.fps_label.set_text(  'FPS: %.1f'  % data.get('fps',   0.0))
         self.state_label.set_text('State: %s'  % data.get('state', '?'))
+
+        bbox      = data.get('bbox')
+        frame_idx = data.get('frame_idx', 0)
+        if bbox and len(bbox) == 4:
+            x, y, w, h = [int(round(v)) for v in bbox]
+            self.bbox_label.set_text('BBox: [%d, %d, %d, %d]' % (x, y, w, h))
+            print('BBOX,%d,%d,%d,%d,%d' % (frame_idx, x, y, w, h), flush=True)
+        else:
+            self.bbox_label.set_text('BBox: --')
+
         return False   # do not repeat
 
     # ── GStreamer bus callbacks ────────────────────────────────────────────

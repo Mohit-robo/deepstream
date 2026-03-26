@@ -586,11 +586,16 @@ class RestAPIThread(threading.Thread):
 
             def do_GET(self):
                 if self.path == '/api/state':
+                    active = state.tracking_state in (
+                        TrackingState.LOCKED, TrackingState.SEARCHING)
+                    bbox = (list(state.id_history.last_bbox)
+                            if active and state.id_history.last_bbox else None)
                     self._send_json(200, {
                         'state':     state.tracking_state.value,
                         'fps':       round(state.fps_counter.fps, 1),
                         'target_id': state.target_id,
                         'frame_idx': state.frame_idx,
+                        'bbox':      bbox,
                     })
                 else:
                     self._send_json(404, {'error': 'not found'})
