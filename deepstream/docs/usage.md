@@ -2,18 +2,19 @@
 
 This guide explains the progression of the SUTrack DeepStream application. We developed it in four major stages, each solving specific performance and usability bottlenecks for Jetson deployment. 
 
-For the most performant and feature-complete experience, we recommend **V4**.
+For local Jetson deployment with a connected monitor, we recommend **V4**. For remote/headless deployment where the operator is on a separate PC, use **V5**.
 
 ---
 
-## The 4 Application Versions
+## The 5 Application Versions
 
 | Version | File | Key Features | Performance |
 |---------|------|--------------|-------------|
 | **V1** | `deepstream_tracker_app.py` | OpenCV appsink, host-memory drawing | Poor (CPU bound) |
 | **V2** | `deepstream_rtsp_app.py` | `nvdsosd` native drawing, RTSP out, PGIE selection | Good (GPU bound) |
 | **V3** | `deepstream_nvtracker_app.py` | Hybrid Tracking (`nvtracker` + `SUTrack`), robust ID management | Good (GPU bound) |
-| **V4** (Recommended) | `deepstream_desktop_app.py` | GTK3 GUI, `TRTWorkerThread`, zero-terminal deployment | **Excellent (~60 FPS)** |
+| **V4** | `deepstream_desktop_app.py` | GTK3 GUI, `TRTWorkerThread`, zero-terminal deployment | **Excellent (~60 FPS)** |
+| **V5** (Remote) | `deepstream_server_app.py` + `v5_remote_client.py` | Headless Jetson server, GTK client on any PC, REST API | **Excellent (~60 FPS)** |
 
 ---
 
@@ -92,6 +93,85 @@ python deepstream/apps/deepstream_desktop_app.py \
     --config deepstream/configs/tracker_config.yml \
     --input /path/to/video.mp4
 ```
+
+---
+
+---
+
+## V5: Client-Server (Remote Deployment)
+**Server:** `deepstream/apps/deepstream_server_app.py` (runs on Jetson — headless)
+**Client:** `deepstream/apps/v5_remote_client.py` (runs on any Linux/Mac PC)
+
+**The Goal:** Decouple the Jetson compute node from the operator's workstation. The Jetson runs a fully headless pipeline — no monitor, no X11, no display server required — and streams annotated video over RTSP. The operator receives the stream on a GTK window on their PC and clicks to select tracking targets.
+
+**Architecture:**
+```
+Jetson (headless)                         Operator PC
+------------------------------            ---------------------------
+deepstream_server_app.py                  v5_remote_client.py
+  |                                         |
+  +--> PGIE detector (ResNet-10)            +--> rtspsrc (TCP)
+  +--> nvtracker (NvDCF)                    +--> h264 decode
+  +--> SUTrack TRT inference                +--> GTK window (click-to-select)
+  +--> nvdsosd (OSD annotations)            +--> HTTP REST client
+  +--> nvv4l2h264enc --> RTSP :8554   <----+     (POST /api/command)
+  +--> REST API :8000   <------------------+
+```
+
+**Key Design Decisions:**
+- **No ROI drawing**: The PGIE detector automatically finds objects every frame. The stream shows labeled boxes for all detections. The operator clicks on the desired target; the server resolves the click to the nearest detection centroid in the live frame — no manual bounding-box drawing at any point.
+- **EGL_PLATFORM=surfaceless**: `nvinfer` on Jetson requires EGL for NVMM buffer operations. In headless SSH sessions `DISPLAY=localhost:N` is an X11-forwarded socket that NVIDIA's libEGL cannot use. The server always sets `EGL_PLATFORM=surfaceless` (and drops any forwarded DISPLAY) to bind EGL directly to the GPU device.
+- **TCP RTSP transport**: `rtspsrc protocols=tcp` in the client forces RTP-over-TCP (interleaved on port 8554) so no random UDP ports need to be open in firewalls between Jetson and PC.
+- **Normalised click coordinates**: Client sends `{x: 0.0-1.0, y: 0.0-1.0}`. Server denormalises and finds the nearest live detection — compensates for ~0.5-1.5 s RTSP latency.
+
+**Run — Server (Jetson, SSH session):**
+```bash
+cd ~/SUTrack
+python3 deepstream/apps/deepstream_server_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --loop
+```
+
+**Run — Client (operator PC):**
+```bash
+python deepstream/apps/v5_remote_client.py --host 192.168.128.178
+```
+
+**Fully automatic (no operator interaction):**
+```bash
+# Server: lock to the largest PGIE detection on the first frame automatically
+python3 deepstream/apps/deepstream_server_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --auto-lock --loop
+```
+
+**V5 CLI Reference:**
+
+| Flag | App | Description |
+|------|-----|-------------|
+| `--config` | Server | Path to `tracker_config.yml` |
+| `--input`, `-i` | Server | Video file, RTSP URL, or omit for camera |
+| `--loop` | Server | Seek to start on EOS (continuous file replay) |
+| `--auto-lock` | Server | Automatically lock to the largest PGIE detection |
+| `--no-pgie` | Server | Skip PGIE (fallback: manual click initialisation with no detection boxes) |
+| `--no-one-shot` | Server | Keep PGIE running every frame after lock (default: PGIE sleeps post-lock) |
+| `--debug-boxes` | Server | Show raw nvtracker boxes in OSD |
+| `--api-port` | Server | REST API port (default: 8000) |
+| `--host` | Client | Jetson IP address (default: 127.0.0.1) |
+| `--rtsp-port` | Client | RTSP server port (default: 8554) |
+| `--api-port` | Client | REST API port (default: 8000) |
+
+**OSD Status Messages:**
+
+| OSD Text | Meaning |
+|----------|---------|
+| `[N DETECTED]  Click on target in client` | PGIE active, N objects visible — waiting for operator click |
+| `[WAITING]  No detections yet...` | PGIE active but no detections on current frame |
+| `[LOCKED] 0.92` | SUTrack tracking with confidence 0.92 |
+| `[SEARCHING...]` | SUTrack lost confidence — running Re-ID |
+| `[TARGET LOST]  N detected — click to re-acquire` | STALE state — new detections shown, click to restart |
 
 ---
 

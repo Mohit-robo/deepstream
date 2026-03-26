@@ -37,8 +37,10 @@ We developed this application in four distinct stages to solve Jetson performanc
     *Native `nvdsosd` drawing + RTSP Server*. Zero CPU copies for display; introduced PGIE "click-to-select" bounding box initialization.
 3.  **V3 Pipeline**: `deepstream_nvtracker_app.py`  
     *Hybrid Tracking*. Runs NVIDIA's `nvtracker` for multi-object tracking at 60 FPS, and selectively correlates a single target using SUTrack via Spatial IoU.
-4.  **V4 Pipeline (Recommended)**: `deepstream_desktop_app.py`  
-    *GTK3 Desktop GUI & Async TRT*. Wraps the pipeline in a GTK UI (no terminal needed) and decouples TRT inference into a background thread, unlocking maximum 60 FPS performance even during active tracking.
+4.  **V4 Pipeline**: `deepstream_desktop_app.py`  
+    *GTK3 Desktop GUI & Async TRT*. Wraps the pipeline in a GTK UI (no terminal needed) and decouples TRT inference into a background thread.
+5.  **V5 Pipeline (Recommended)**: `deepstream_server_app.py` & `v5_remote_client.py`  
+    *Headless Distributed Architecture*. Runs the tracker headlessly on Jetson with a REST API/RTSP Server, and allows complete remote control/viewing from a lightweight PC client.
 
 ## Getting Started
 
@@ -47,11 +49,13 @@ We developed this application in four distinct stages to solve Jetson performanc
 3.  **Run Guide**: For full CLI commands and application walkthroughs, read [`deepstream/docs/usage.md`](deepstream/docs/usage.md).
 
 ```bash
-# Example: Run the recommended V4 GTK Desktop App
-export DISPLAY=:0
-python deepstream/apps/deepstream_desktop_app.py \
+# Example: Run the recommended V5 Distributed Server on Jetson
+python deepstream/apps/deepstream_server_app.py \
     --config deepstream/configs/tracker_config.yml \
-    --input /path/to/video.mp4
+    --input /path/to/video.mp4 --loop
+
+# On your Local PC Client:
+python v5_remote_client.py --host <JETSON_IP>
 ```
 
 ## Performance (Jetson Orin)

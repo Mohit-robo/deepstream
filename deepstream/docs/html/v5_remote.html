@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>V5: Remote Client-Server — SUTrack DeepStream Docs</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <a class="sidebar-logo" href="index.html">
+    <div class="logo-icon">S</div>
+    <div>
+      <div class="logo-text">SUTrack DeepStream</div>
+      <div class="logo-sub">Documentation</div>
+    </div>
+  </a>
+
+  <div class="sidebar-section">Navigation</div>
+  <nav>
+    <a href="index.html"><span class="nav-icon">&#127968;</span> Overview</a>
+    <a href="install.html"><span class="nav-icon">&#128230;</span> Installation</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Application Versions</div>
+    <a href="v1_legacy.html"><span class="nav-icon">&#128034;</span> V1: Legacy OpenCV</a>
+    <a href="v2_native.html"><span class="nav-icon">&#127916;</span> V2: Native OSD &amp; RTSP</a>
+    <a href="v3_hybrid.html"><span class="nav-icon">&#129309;</span> V3: Hybrid Tracking</a>
+    <a href="v4_desktop.html"><span class="nav-icon">&#128187;</span> V4: GTK Desktop App</a>
+    <a href="v5_remote.html" class="active"><span class="nav-icon">&#127760;</span> V5: Remote Client-Server</a>
+
+    <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
+    <a href="engine.html"><span class="nav-icon">&#9889;</span> TensorRT Engine</a>
+    <a href="tracker-logic.html"><span class="nav-icon">&#127919;</span> Tracker Logic</a>
+    <a href="multi-object.html"><span class="nav-icon">&#128101;</span> Multi-Object Manager</a>
+  </nav>
+
+  <div class="sidebar-section">On This Page</div>
+  <nav>
+    <a href="#architecture"><span class="nav-icon">&#127760;</span> Architecture</a>
+    <a href="#headless-egl"><span class="nav-icon">&#9881;</span> Headless EGL Fix</a>
+    <a href="#pgie-autodetect"><span class="nav-icon">&#128269;</span> PGIE Auto-Detect</a>
+    <a href="#server-pipeline"><span class="nav-icon">&#128257;</span> Server Pipeline</a>
+    <a href="#client-pipeline"><span class="nav-icon">&#128250;</span> Client Pipeline</a>
+    <a href="#rest-api"><span class="nav-icon">&#128279;</span> REST API</a>
+    <a href="#running"><span class="nav-icon">&#9654;</span> Running V5</a>
+    <a href="#cli-reference"><span class="nav-icon">&#128196;</span> CLI Reference</a>
+    <a href="#troubleshooting"><span class="nav-icon">&#128295;</span> Troubleshooting</a>
+  </nav>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ CONTENT -->
+<main class="content">
+
+  <div class="page-header">
+    <div class="page-badge">&#127760; Phase 12 — apps/deepstream_server_app.py + v5_remote_client.py</div>
+    <h1>V5: Remote Client-Server</h1>
+    <p>
+      Phase 12 (V5) separates compute from the operator. The Jetson runs a fully headless server — no
+      monitor, no display server, no X11 required — streaming annotated video over RTSP while
+      exposing a REST control API. The operator connects from any PC using a lightweight GTK client,
+      sees the live stream, and clicks to select tracking targets.
+    </p>
+  </div>
+
+  <!-- ── Architecture ─────────────────────────────────────── -->
+  <h2 id="architecture">Architecture</h2>
+
+  <div class="diagram"><span class="d-title">V5 SYSTEM OVERVIEW</span>
+
+  JETSON (headless SSH)                      OPERATOR PC
+  ================================           ==============================
+  deepstream_server_app.py                   v5_remote_client.py
+    |                                          |
+    +--> filesrc / v4l2src                     +--> rtspsrc (TCP, port 8554)
+    +--> decodebin                             +--> rtph264depay
+    +--> nvvideoconvert                        +--> h264parse + avdec_h264
+    +--> nvstreammux                           +--> videoconvert
+    +--> nvinfer (PGIE ResNet-10) ----------+  +--> GTK DrawingArea (Cairo)
+    +--> nvtracker (NvDCF)                  |  |
+    +--> nvdsosd (OSD annotations) &lt;--------+  +--> REST client thread
+    +--> tee                                      |  GET  /api/state  (0.5 s poll)
+         |--&gt; fakesink (headless branch)          |  POST /api/command
+         |--&gt; nvv4l2h264enc                       |
+              --&gt; rtph264pay --&gt; udpsink     click --&gt; POST /api/command {click, x, y}
+                                  |          key   --&gt; POST /api/command {select/lock/...}
+  GstRtspServer (port 8554) &lt;----+
+  REST API       (port 8000) &lt;-------- &lt;----- HTTP</div>
+
+  <p>
+    The two processes communicate over two independent channels:
+  </p>
+  <ul>
+    <li><strong>RTSP stream (port 8554, TCP)</strong>: annotated H.264 video — OSD boxes, state banners, confidence scores — rendered entirely on the Jetson GPU.</li>
+    <li><strong>REST API (port 8000, HTTP)</strong>: low-rate control channel. Client polls state every 0.5 s and POSTs commands (click, select, lock, cancel).</li>
+  </ul>
+
+  <!-- ── Headless EGL ──────────────────────────────────────── -->
+  <h2 id="headless-egl">Headless EGL Fix: <code>EGL_PLATFORM=surfaceless</code></h2>
+
+  <p>
+    <code>nvinfer</code> (PGIE) on Jetson uses EGL to create <code>EGLImage</code> objects from NVMM
+    (Surface Array) buffers during inference. This requires a usable EGL context — which in turn
+    requires a GPU device connection. In a normal SSH session without X11, no display is available
+    and the pipeline fails immediately:
+  </p>
+
+  <div class="diagram"><span class="d-title">FAILURE MODE (unpatched)</span>
+
+  $ ssh phoenix@jetson
+  $ python3 deepstream_server_app.py ...
+  nvbufsurface: Failed to create EGLImage.
+  WARN nvinfer: Failed to set buffer pool to active
+  ERROR: Pipeline failed to enter PLAYING state.</div>
+
+  <h3>Why X11 Forwarding Does Not Help</h3>
+
+  <p>
+    SSH with <code>-X</code> sets <code>DISPLAY=localhost:10.0</code> — a forwarded X11 socket tunnelled
+    back to the operator PC. NVIDIA's <code>libEGL</code> on Jetson cannot use this because:
+  </p>
+  <ul>
+    <li>EGLImage creation for NVMM buffers requires a <em>local</em> DRM/tegra device.</li>
+    <li>The forwarded X11 socket has no backing local GPU device — it is a network connection to a remote X server.</li>
+    <li><code>xdpyinfo</code> reports the display as reachable (X11 protocol works), but the EGL layer never sees a local framebuffer.</li>
+  </ul>
+
+  <div class="callout warning">
+    <div class="callout-title">Do not test EGL usability with xdpyinfo</div>
+    <code>xdpyinfo</code> tests X11 protocol connectivity, not GPU device access. A display that passes
+    <code>xdpyinfo</code> can still fail EGLImage creation if it is a forwarded socket.
+  </div>
+
+  <h3>The Fix</h3>
+
+  <p>
+    The server drops any forwarded <code>DISPLAY</code> and sets <code>EGL_PLATFORM=surfaceless</code>
+    before any GStreamer or DeepStream import. This uses the <code>EGL_EXT_platform_device</code>
+    extension to bind EGL directly to the GPU device — no window system required at all.
+  </p>
+
+  <div class="diagram"><span class="d-title">STARTUP ENVIRONMENT SETUP (deepstream_server_app.py)</span>
+
+  # 1. Drop forwarded DISPLAY (e.g. 'localhost:10.0')
+  disp = os.environ.get('DISPLAY', '')
+  if disp and not disp.startswith(':'):     # remote host prefix = forwarded
+      del os.environ['DISPLAY']
+
+  # 2. Surfaceless EGL -- GPU device direct, no display server needed
+  os.environ['EGL_PLATFORM'] = 'surfaceless'
+
+  # 3. DeepStream headless hints
+  os.environ['NV_DS_HEADLESS'] = '1'
+  os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+
+  # (Must run before any GStreamer/DeepStream import and before LD_PRELOAD re-exec)</div>
+
+  <div class="callout rule">
+    <div class="callout-title">Lesson 36: EGL_PLATFORM=surfaceless for headless Jetson</div>
+    For any headless Jetson DeepStream deployment (SSH, Docker, CI), always set
+    <code>EGL_PLATFORM=surfaceless</code> and remove any forwarded <code>DISPLAY</code>. This is
+    NVIDIA's recommended mechanism for display-free inference. It must be set before the first
+    GStreamer import and must be inherited by any child process (set before LD_PRELOAD re-exec).
+  </div>
+
+  <!-- ── PGIE Auto-Detect ──────────────────────────────────── -->
+  <h2 id="pgie-autodetect">PGIE Auto-Detect: No ROI Drawing</h2>
+
+  <p>
+    In V4, the operator first sees a blank (or frozen) screen and must draw a bounding box to initialize
+    the tracker. V5 eliminates this — the ResNet-10 PGIE detector runs every frame and automatically
+    annotates all detected objects on the RTSP stream. The operator simply clicks on the object they
+    want to track; no bounding box drawing is ever needed.
+  </p>
+
+  <h3>Detection-Driven IDLE State</h3>
+
+  <p>
+    When the server is in <strong>IDLE</strong> state (no target locked), the pad probe draws all
+    current detections as light-blue labeled boxes and displays a status banner. The operator
+    sees exactly what the detector sees in real-time:
+  </p>
+
+  <div class="diagram"><span class="d-title">IDLE STATE OSD (PGIE active, 3 objects detected)</span>
+
+  +-------------------------------------------------------+
+  | [3 DETECTED]  Click on target in client               |
+  |                                                       |
+  |  +--[Person]--+    +--[Person]--+    +-[Person]-+    |
+  |  |            |    |            |    |          |    |
+  |  +------------+    +------------+    +----------+    |
+  |                                                       |
+  +-------------------------------------------------------+</div>
+
+  <h3>Click-to-Select Flow</h3>
+
+  <p>
+    When the operator clicks anywhere on the client video canvas, the client sends normalized
+    coordinates <code>{x: 0.0-1.0, y: 0.0-1.0}</code> to the server. The server:
+  </p>
+  <ol>
+    <li>Denormalizes the click using its own live frame dimensions.</li>
+    <li>Finds the detection whose centroid is nearest to the click point (Euclidean distance).</li>
+    <li>Queues <code>_pending_lock</code> — processed on the next probe call with the live frame.</li>
+    <li>Initializes SUTrack with that detection's bounding box and enters <strong>LOCKED</strong> state.</li>
+  </ol>
+
+  <div class="callout note">
+    <div class="callout-title">Normalized coordinates compensate for RTSP latency</div>
+    The RTSP stream has ~0.5-1.5 s of buffering latency. If the client sent raw pixel coordinates,
+    they would correspond to a frame that the server processed 1.5 s ago — the target has moved on.
+    By sending normalized spatial cues (<em>"near the left third, upper half"</em>) and resolving
+    them to <em>current live detections</em> on the server side, the click selects the right object
+    regardless of latency.
+  </div>
+
+  <h3>Auto-Lock Mode (<code>--auto-lock</code>)</h3>
+
+  <p>
+    For fully automated pipelines where no operator interaction is available, <code>--auto-lock</code>
+    causes the server to pick the largest detected object (by bounding-box area) on the first frame
+    that contains detections and initialize tracking immediately — zero human input.
+  </p>
+
+  <!-- ── Server Pipeline ───────────────────────────────────── -->
+  <h2 id="server-pipeline">Server Pipeline</h2>
+
+  <div class="diagram"><span class="d-title">SERVER PIPELINE (deepstream_server_app.py)</span>
+
+  filesrc/v4l2src
+      |
+  decodebin  (dynamic pad-added)
+      |
+  nvvideoconvert  [nvbuf-memory-type=4, NV12]
+      |
+  capsfilter  [video/x-raw(memory:NVMM), NV12]
+      |
+  nvstreammux  [batch=1, WxH from config]
+      |
+  nvinfer (PGIE)  [ResNet-10 INT8 -- detections every frame]
+      |
+  nvtracker (NvDCF)  [multi-object ID assignment]
+      |
+  +-----------pad probe (tracker_probe)----------+
+  |  - _capture_dets()    read NvDsObjectMeta    |
+  |  - IDLE: draw all detections + banner        |
+  |  - LOCKED: submit_track() to TRTWorkerThread |
+  |  - STALE: draw detections + re-acquire msg   |
+  +----------------------------------------------+
+      |
+  nvvideoconvert  [RGBA bridge]
+      |
+  capsfilter  [video/x-raw(memory:NVMM), RGBA]
+      |
+  nvdsosd  [process-mode=0 CPU]
+      |
+  tee
+   +-- queue --> fakesink          (headless: discards rendered frames)
+   +-- queue --> nvvideoconvert
+                    --> nvv4l2h264enc  [FP32, iframeinterval=30]
+                    --> rtph264pay    [pt=96, config-interval=1]
+                    --> udpsink       [127.0.0.1:5400]
+
+  GstRtspServer
+    factory: udpsrc:5400 ! rtph264depay ! rtph264pay name=pay0 pt=96
+    mount:   rtsp://0.0.0.0:8554/sutrack</div>
+
+  <h3>TRTWorkerThread</h3>
+
+  <p>
+    SUTrack TRT inference (~30 ms on Jetson) runs in a dedicated background thread — never in the
+    GStreamer probe. The probe submits frames non-blocking via a pending-slot and reads the last
+    computed result for OSD. This allows the pipeline to run at full source rate (~60 FPS) while
+    the tracker runs at its hardware-limited rate (~30 FPS).
+  </p>
+
+  <!-- ── Client Pipeline ───────────────────────────────────── -->
+  <h2 id="client-pipeline">Client Pipeline</h2>
+
+  <div class="diagram"><span class="d-title">CLIENT PIPELINE (v5_remote_client.py)</span>
+
+  rtspsrc  [location=rtsp://&lt;host&gt;:8554/sutrack, protocols=tcp, latency=200]
+      |
+  rtph264depay
+      |
+  h264parse
+      |
+  avdec_h264  (software decode on PC)
+      |
+  videoconvert
+      |
+  capsfilter  [video/x-raw, format=RGB]
+      |
+  appsink  [emit-signals=true, max-buffers=1, drop=true, sync=false]
+      |
+  on_new_sample() callback
+      --> convert to numpy array
+      --> scale to fit GTK DrawingArea (aspect-preserving letterbox)
+      --> draw via Cairo surface
+      --> GTK invalidate (GLib.idle_add)</div>
+
+  <h3>TCP Transport</h3>
+
+  <p>
+    <code>rtspsrc protocols=tcp</code> forces RTP-over-TCP interleaving. All media data travels
+    over the existing port 8554 TCP connection — no additional UDP ports are allocated. This is
+    essential when any firewall or NAT exists between the Jetson and the operator PC.
+  </p>
+
+  <div class="callout warning">
+    <div class="callout-title">Default rtspsrc uses UDP — will fail through firewalls</div>
+    Without <code>protocols=tcp</code>, <code>rtspsrc</code> allocates random UDP ports for RTP
+    media transport. These ports are almost always blocked by firewalls on corporate or home
+    networks. Always use <code>protocols=tcp</code> (or <code>protocols=0x4</code>) for
+    remote deployments.
+  </div>
+
+  <h3>Auto-Reconnect</h3>
+
+  <p>
+    If the RTSP connection is lost (server restart, network glitch), the client automatically retries
+    after 5 seconds using <code>GLib.timeout_add_seconds(5, self._reconnect)</code>. The pipeline is
+    set to NULL, the frame buffer is cleared, and a new <code>rtspsrc</code> pipeline is constructed.
+    The GTK window shows a black canvas until the connection is restored.
+  </p>
+
+  <!-- ── REST API ──────────────────────────────────────────── -->
+  <h2 id="rest-api">REST API</h2>
+
+  <p>The server exposes a minimal HTTP API on port 8000.</p>
+
+  <h3>GET /api/state</h3>
+
+  <p>Returns the current tracking state. Polled by the client every 0.5 s to update the status bar.</p>
+
+  <table>
+    <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>state</code></td><td>string</td><td><code>idle</code> | <code>selecting</code> | <code>locked</code> | <code>searching</code> | <code>stale</code></td></tr>
+      <tr><td><code>fps</code></td><td>float</td><td>Pipeline FPS (60-frame sliding window)</td></tr>
+      <tr><td><code>target_id</code></td><td>int</td><td>NvDCF tracker ID of locked target (-1 = none)</td></tr>
+      <tr><td><code>frame_idx</code></td><td>int</td><td>Monotonic frame counter since pipeline start</td></tr>
+    </tbody>
+  </table>
+
+  <h3>POST /api/command</h3>
+
+  <p>Sends a control command. Body is JSON.</p>
+
+  <table>
+    <thead><tr><th>Action</th><th>Extra fields</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>click</code></td><td><code>x</code>, <code>y</code> (float 0-1)</td><td>Lock to the nearest detection to the normalized click point in the current live frame</td></tr>
+      <tr><td><code>select</code></td><td>—</td><td>Enter SELECTING mode — OSD highlights first candidate</td></tr>
+      <tr><td><code>next</code></td><td>—</td><td>Cycle selection to next detection</td></tr>
+      <tr><td><code>prev</code></td><td>—</td><td>Cycle selection to previous detection</td></tr>
+      <tr><td><code>lock</code></td><td>—</td><td>Initialize SUTrack on currently highlighted detection</td></tr>
+      <tr><td><code>cancel</code></td><td>—</td><td>Stop tracking, return to IDLE</td></tr>
+    </tbody>
+  </table>
+
+  <h3>OSD State Messages</h3>
+
+  <table>
+    <thead><tr><th>OSD Text</th><th>State</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>[N DETECTED]  Click on target in client</code></td><td>IDLE</td><td>PGIE found N objects — operator should click</td></tr>
+      <tr><td><code>[WAITING]  No detections yet...</code></td><td>IDLE</td><td>PGIE active but no objects in frame</td></tr>
+      <tr><td><code>[SELECT N/M]  Send next/prev/lock command</code></td><td>SELECTING</td><td>Cycling through M detections; N currently highlighted</td></tr>
+      <tr><td><code>[LOCKED] 0.92</code></td><td>LOCKED</td><td>SUTrack tracking; 0.92 = confidence score</td></tr>
+      <tr><td><code>[SEARCHING...]</code></td><td>SEARCHING</td><td>Low confidence — Re-ID scan in progress</td></tr>
+      <tr><td><code>[TARGET LOST]  N detected — click to re-acquire</code></td><td>STALE</td><td>Tracker exceeded hibernate_after frames — new detections shown</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Running V5 ────────────────────────────────────────── -->
+  <h2 id="running">Running V5</h2>
+
+  <h3>Prerequisites</h3>
+  <ul>
+    <li>Jetson: DeepStream 6.x, TRT engine at <code>~/SUTrack/sutrack_fp32.engine</code></li>
+    <li>Jetson: Python packages: <code>pyds</code>, <code>gi</code>, <code>numpy</code>, <code>opencv-python</code></li>
+    <li>Operator PC: <code>python3-gi</code>, <code>gstreamer1.0-plugins-*</code>, <code>gstreamer1.0-libav</code>, <code>gir1.2-gtk-3.0</code>, <code>requests</code></li>
+  </ul>
+
+  <h3>Step 1 — Start the Server (Jetson)</h3>
+
+  <div class="diagram">cd ~/SUTrack
+python3 deepstream/apps/deepstream_server_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --loop
+
+# Expected startup output:
+# [server] Dropping X11-forwarded DISPLAY=localhost:10.0 (not usable by nvinfer).
+# [server] EGL_PLATFORM=surfaceless (headless nvinfer -- no display required).
+# [INFO] tracker.sutrack_engine: SUTrackEngine ready. feat_sz=14
+# [INFO] main: RTSP stream:  rtsp://192.168.x.x:8554/sutrack
+# [INFO] main: REST API:     http://192.168.x.x:8000/api/</div>
+
+  <h3>Step 2 — Start the Client (Operator PC)</h3>
+
+  <div class="diagram">python deepstream/apps/v5_remote_client.py --host 192.168.x.x
+
+# The GTK window opens showing the RTSP stream.
+# Detection boxes appear in blue labelled with class names.
+# Click on the object you want to track.
+# Tracking begins immediately -- box turns green with confidence score.</div>
+
+  <h3>Fully Automatic (no operator interaction)</h3>
+
+  <div class="diagram">python3 deepstream/apps/deepstream_server_app.py \
+    --config deepstream/configs/tracker_config.yml \
+    --input /path/to/video.mp4 \
+    --auto-lock --loop</div>
+
+  <p>
+    With <code>--auto-lock</code>, the server locks onto the largest PGIE detection in the first frame
+    that contains detections. No operator click is required. Useful for fixed-camera deployments
+    where the target is known to be the dominant object in the scene.
+  </p>
+
+  <!-- ── CLI Reference ─────────────────────────────────────── -->
+  <h2 id="cli-reference">CLI Reference</h2>
+
+  <h3>Server (<code>deepstream_server_app.py</code>)</h3>
+
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>--config</code></td><td><code>deepstream/configs/tracker_config.yml</code></td><td>Path to tracker config YAML</td></tr>
+      <tr><td><code>--input</code>, <code>-i</code></td><td>camera (v4l2)</td><td>Video file path or RTSP URL; omit for camera</td></tr>
+      <tr><td><code>--loop</code></td><td>off</td><td>Seek to position 0 on EOS for continuous file replay</td></tr>
+      <tr><td><code>--auto-lock</code></td><td>off</td><td>Lock to largest PGIE detection automatically; no operator click required</td></tr>
+      <tr><td><code>--no-pgie</code></td><td>off</td><td>Skip nvinfer (manual click creates a fixed-size seed bbox; no detection boxes shown)</td></tr>
+      <tr><td><code>--no-one-shot</code></td><td>off</td><td>Keep PGIE running every frame after lock (default: PGIE sleeps to save power)</td></tr>
+      <tr><td><code>--debug-boxes</code></td><td>off</td><td>Show raw nvtracker bounding boxes in OSD for drift analysis</td></tr>
+      <tr><td><code>--api-port</code></td><td>8000</td><td>REST API listen port</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Client (<code>v5_remote_client.py</code>)</h3>
+
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>--host</code></td><td><code>127.0.0.1</code></td><td>Jetson IP address</td></tr>
+      <tr><td><code>--rtsp-port</code></td><td>8554</td><td>RTSP server port</td></tr>
+      <tr><td><code>--api-port</code></td><td>8000</td><td>REST API port</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Client Keyboard Shortcuts</h3>
+
+  <table>
+    <thead><tr><th>Key</th><th>REST Command</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>s</code></td><td>select</td><td>Enter SELECTING mode</td></tr>
+      <tr><td><code>n</code></td><td>next</td><td>Next candidate</td></tr>
+      <tr><td><code>p</code></td><td>prev</td><td>Previous candidate</td></tr>
+      <tr><td><code>l</code> / Enter</td><td>lock</td><td>Lock on current candidate</td></tr>
+      <tr><td><code>q</code> / Esc</td><td>cancel</td><td>Stop tracking</td></tr>
+      <tr><td>Mouse click</td><td>click {x, y}</td><td>Lock to nearest detection at click point</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Troubleshooting ───────────────────────────────────── -->
+  <h2 id="troubleshooting">Troubleshooting</h2>
+
+  <table>
+    <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>nvbufsurface: Failed to create EGLImage</code></td>
+        <td>nvinfer cannot find a usable EGL context. <code>DISPLAY</code> is either unset or a forwarded X11 socket.</td>
+        <td>Ensure <code>EGL_PLATFORM=surfaceless</code> is set before any GStreamer import. The server sets this automatically — do not override it.</td>
+      </tr>
+      <tr>
+        <td>Client connects but video never appears (RTSP timeout after 20 s)</td>
+        <td>Either GstRtspServer SDP generation failed (factory string wrong) or UDP RTP ports are blocked.</td>
+        <td>Confirm <code>rtph264pay name=pay0</code> is in the factory launch string. Confirm client uses <code>protocols=tcp</code>.</td>
+      </tr>
+      <tr>
+        <td>Click does not select correct object</td>
+        <td>RTSP latency mismatch — click was resolved against a stale frame; or PGIE is disabled so no detections exist.</td>
+        <td>Ensure PGIE is running (<code>--no-pgie</code> not set). Click latency compensation works best for slow-moving targets. Use <code>select/next/lock</code> workflow for precise selection.</td>
+      </tr>
+      <tr>
+        <td><code>[WAITING] No detections yet...</code> persists</td>
+        <td>PGIE model path is wrong or the engine was built for a different GPU.</td>
+        <td>Check <code>pgie_config.txt</code> paths. Verify the engine exists: <code>ls /opt/nvidia/deepstream/deepstream/samples/models/Primary_Detector/*.engine</code></td>
+      </tr>
+      <tr>
+        <td>Client GTK window opens but stays black</td>
+        <td>GStreamer not yet connected or server not yet ready.</td>
+        <td>Wait 5-10 s for RTSP negotiation and auto-reconnect. Check server is running and RTSP port 8554 is reachable: <code>nc -zv &lt;host&gt; 8554</code></td>
+      </tr>
+      <tr>
+        <td><code>ModuleNotFoundError: pyds</code> on server</td>
+        <td>pyds Python bindings not installed.</td>
+        <td>Install the pyds wheel for your DeepStream version from the JetPack SDK Manager or NVIDIA Developer Zone.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:2rem">
+    <a href="v4_desktop.html" class="card" style="text-decoration:none">
+      <div class="card-title">&larr; V4: GTK Desktop App</div>
+      <div class="card-body">Local Jetson deployment with embedded video canvas and TRTWorkerThread FPS unlock.</div>
+    </a>
+    <a href="engine.html" class="card" style="text-decoration:none">
+      <div class="card-title">TensorRT Engine &rarr;</div>
+      <div class="card-body">How the SUTrack model runs on GPU: buffer allocation, named bindings, and FP32 precision.</div>
+    </a>
+  </div>
+
+</main>
+</body>
+</html>

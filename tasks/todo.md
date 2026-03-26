@@ -201,6 +201,43 @@ onfig.yml`; `--pgie-config` and `--no-pgie` CLI args
 
 ---
 
+## 🔲 Phase 12 — V5 Client-Server Distributed Architecture
+
+### 12.1 Backend Daemon (`deepstream_server_app.py`)
+- [x] Draft Client-Server Architecture Plan (`docs/architecture_docs/v5_client_server_plan.md`)
+- [x] Create `deepstream_server_app.py` based on `deepstream_desktop_app.py`
+- [x] Implement headless pipeline (force `fakesink` display, keep RTSP branch)
+- [x] Develop REST Control API server thread (Port 8000) for incoming commands
+- [x] Implement normalized `(x, y)` coordinate localization against `nvtracker` bounding boxes
+
+### 12.2 Frontend Client (`v5_remote_client.py`)
+- [x] Create `v5_remote_client.py` GTK3 application
+- [x] Implement GStreamer `uridecodebin` pipeline to receive RTSP feed locally
+- [x] Re-implement `on_mouse_click` and keybindings to dispatch async HTTP POSTs
+- [x] Implement API state polling to update GUI FPS/Status labels, aspect-fit scaled, centred)
+- [x] Mouse click: normalise via `_draw_rect`, POST `{action: click, x, y}` async
+- [x] Keyboard: s/n/p/l/Enter/q/Esc/x → REST commands (fire-and-forget daemon threads)
+- [x] State polling daemon thread: GET /api/state every 0.5 s → update FPS/State labels
+- [x] Fallback manual pipeline if parse_launch fails (explicit pad-added)
+
+### 12.3 Integration Fixes Applied
+- [x] Fix headless PGIE (nvinfer) on Jetson: drop X11-forwarded DISPLAY, set EGL_PLATFORM=surfaceless
+- [x] Fix GstRtspServer factory string: udpsrc -> rtph264depay -> rtph264pay name=pay0 (SDP generation)
+- [x] Fix RTSP transport: rtspsrc protocols=tcp in client (UDP ports blocked by firewall/NAT)
+- [x] Fix GStreamer reconnect: auto-retry on error/EOS via GLib.timeout_add_seconds
+- [x] Add --loop flag: seek to position 0 on EOS for continuous file replay
+- [x] Add detection-driven UX: show PGIE boxes in IDLE/STALE states, status "N DETECTED -- click target"
+- [x] Add --auto-lock flag: lock to largest PGIE detection automatically (zero user interaction)
+- [x] Record Lesson 36: X11 forwarding + EGL_PLATFORM=surfaceless
+
+### 12.4 Verification & Deployment
+- [x] Run backend on Jetson, frontend on local machine -- RTSP stream confirmed working
+- [x] PGIE detector runs headless (EGL_PLATFORM=surfaceless fix verified)
+- [x] Click-to-select works through RTSP latency (normalised coord compensation)
+- [x] Update `docs/usage.md` and `docs/html/index.html` with V5 instructions
+
+---
+
 ## Critical Rules (must not break)
 - FP32 only — no `--fp16` in engine
 - No double sigmoid on `score_map`/`size_map`

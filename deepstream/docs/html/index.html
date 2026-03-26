@@ -28,6 +28,7 @@
     <a href="v2_native.html"><span class="nav-icon">🎬</span> V2: Native OSD &amp; RTSP</a>
     <a href="v3_hybrid.html"><span class="nav-icon">🤝</span> V3: Hybrid Tracking</a>
     <a href="v4_desktop.html"><span class="nav-icon">💻</span> V4: GTK Desktop App</a>
+    <a href="v5_remote.html"><span class="nav-icon">🌐</span> V5: Remote Client-Server</a>
 
     <div style="margin: 20px 0 8px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600;">Technical Deep Dives</div>
     <a href="engine.html"><span class="nav-icon">⚡</span> TensorRT Engine</a>
@@ -129,8 +130,18 @@ Steps per frame (after init):
     </thead>
     <tbody>
       <tr>
+        <td><code>apps/deepstream_server_app.py</code></td>
+        <td><strong>Phase 12 (V5 — Remote Server)</strong> — Headless Jetson daemon: PGIE detector, REST API, RTSP stream. <code>EGL_PLATFORM=surfaceless</code> for SSH/no-display deployment.</td>
+        <td><a href="v5_remote.html">V5: Remote</a></td>
+      </tr>
+      <tr>
+        <td><code>apps/v5_remote_client.py</code></td>
+        <td><strong>Phase 12 (V5 — Operator Client)</strong> — GTK3 client on operator PC: receives RTSP over TCP, click-to-select dispatches REST commands.</td>
+        <td><a href="v5_remote.html">V5: Remote</a></td>
+      </tr>
+      <tr>
         <td><code>apps/deepstream_desktop_app.py</code></td>
-        <td><strong>Phase 11 (V4 Recommended)</strong> — GTK3 GUI, async TRT worker (~60 FPS in tracking), hardware video canvas.</td>
+        <td><strong>Phase 11 (V4)</strong> — GTK3 GUI, async TRT worker (~60 FPS in tracking), hardware video canvas.</td>
         <td><a href="v4_desktop.html">V4: Desktop App</a></td>
       </tr>
       <tr>
@@ -334,7 +345,12 @@ pipeline:
     <a class="card" href="v4_desktop.html" style="text-decoration:none;color:inherit;">
       <div class="card-icon">💻</div>
       <h4>V4: GTK Desktop App</h4>
-      <p>Our final production V4 app. Wraps the tracking pipeline inside a native Linux window, provides UI buttons, handles Re-ID, and unlocks 60 FPS using an async TRT worker thread.</p>
+      <p>Local Jetson deployment. Wraps the tracking pipeline inside a native Linux window, provides UI buttons, handles Re-ID, and unlocks 60 FPS using an async TRT worker thread.</p>
+    </a>
+    <a class="card" href="v5_remote.html" style="text-decoration:none;color:inherit;">
+      <div class="card-icon">🌐</div>
+      <h4>V5: Remote Client-Server</h4>
+      <p>Headless Jetson server streams annotated video over RTSP. Operator PC runs a GTK client: click to select tracked target, all commands sent over REST. No display on Jetson required.</p>
     </a>
     <a class="card" href="engine.html" style="text-decoration:none;color:inherit;">
       <div class="card-icon">⚡</div>

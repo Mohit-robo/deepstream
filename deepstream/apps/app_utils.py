@@ -151,9 +151,10 @@ def setup_rtsp_server(rtsp_port, udp_port, mount_path='/sutrack'):
 
     factory = GstRtspServer.RTSPMediaFactory.new()
     factory.set_launch(
-        '( udpsrc name=pay0 port=%d '
+        '( udpsrc port=%d '
         'caps="application/x-rtp,media=video,clock-rate=90000,'
-        'encoding-name=H264,payload=96" )' % udp_port
+        'encoding-name=H264,payload=96" ! '
+        'rtph264depay ! rtph264pay name=pay0 pt=96 )' % udp_port
     )
     factory.set_shared(True)
 

@@ -567,4 +567,52 @@ Additional gains from the same fix:
 
 **Result:** Pipeline FPS in LOCKED mode: 20-24 FPS → ~55-60 FPS. TRT inference rate unchanged (~28-33 FPS, hardware-limited).
 
+---
+
+## Lesson 35 — V5 Client-Server: normalised click coordinates solve RTSP latency
+
+**Context:** Phase 12 adds a distributed architecture where the GTK client on a local PC receives an RTSP stream (~0.5-1.5 s delay) and the user clicks to select a target.
+
+**Problem:** If the client sends the raw pixel coordinates of where the user clicked on the (delayed) video frame, those coordinates correspond to where the bounding box *was* 0.5-1.5 s ago — the server's live frame has moved on, so the lock hits the wrong region.
+
+**Root cause:** RTSP introduces buffering latency. The pixel position of a detection at the moment of click on the client is systematically offset from its position in the server's current live frame.
+
+**Fix:** Decouple the coordinate space from the frame timestamp.
+1. Client normalises the click: `nx = (click_x - video_ox) / video_width`, `ny` similarly → `[0.0, 1.0]`.
+2. Client POSTs `{action: "click", x: nx, y: ny}` to the server.
+3. Server denormalises to pixel space using its own `frame_width` / `frame_height`.
+4. Server finds the detection with the minimum Euclidean distance to that pixel point **in the current live frame**.
+
+**Why this works:** The user clicks on an object, not a coordinate. The normalised position is a spatial cue ("near the left third, upper half") that is stable across the 1.5 s latency window if the target is slow-moving. For fast objects, "nearest detection to click point" still selects the intended target in most cases.
+
+**Rule:** In any latency-affected click-to-select flow, always send normalised spatial coordinates and resolve to detections on the receiving (low-latency) end. Never send absolute pixel coordinates that are coupled to a delayed frame timestamp.
+
+---
+
 **Rule:** Never run TRT inference (or any operation > 2 ms) directly inside a GStreamer pad probe. Use a worker thread with a pending-slot double-buffer pattern. The probe submits work and reads the last result immediately.
+
+---
+
+## Lesson 36 — X11-forwarded DISPLAY is not usable by NVIDIA EGL on Jetson
+
+**Context:** Running `deepstream_server_app.py` over an SSH session with X11 forwarding (`ssh -X`).
+
+**Mistake:** Assumed that any reachable `DISPLAY` value (including `localhost:10.0` from X11 forwarding) would satisfy nvinfer's EGL requirements.
+
+**Root cause:** `DISPLAY=localhost:10.0` is a tunnelled X11 socket pointing back to the remote PC. NVIDIA's libEGL on Jetson needs a local DRM/tegra device to create EGLImages from NVMM buffers. A forwarded X11 connection has no backing local GPU device, so `nvbufsurface: Failed to create EGLImage` is thrown even though `xdpyinfo` reports the display as reachable.
+
+**Fix:**
+1. Detect forwarded displays (host part != empty, i.e., `DISPLAY` does not start with `:`).
+2. Remove `DISPLAY` from the environment so libEGL does not attempt to use it.
+3. Set `EGL_PLATFORM=surfaceless` — this uses `EGL_EXT_platform_device` to bind EGL directly to the GPU device without any window system.
+
+```python
+disp = os.environ.get('DISPLAY', '')
+if disp and not disp.startswith(':'):   # forwarded (e.g. 'localhost:10.0')
+    del os.environ['DISPLAY']
+os.environ['EGL_PLATFORM'] = 'surfaceless'
+```
+
+This must be set **before** any GStreamer or DeepStream import (and before the `LD_PRELOAD` re-exec so the child process inherits it).
+
+**Rule:** For headless Jetson DeepStream deployments (SSH, Docker, CI), always set `EGL_PLATFORM=surfaceless` and remove any forwarded `DISPLAY`. Never rely on xdpyinfo to validate EGL usability — it tests X11 connectivity, not GPU device access.
